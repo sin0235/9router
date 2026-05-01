@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(node --input-type=module -e \"import\\('./src/lib/r2DbSync.js'\\).then\\(\\(\\) => console.log\\('ok'\\)\\)\")"
+    ]
+  }
+}
