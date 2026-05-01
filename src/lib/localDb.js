@@ -5,6 +5,7 @@ import path from "node:path";
 import fs from "node:fs";
 import lockfile from "proper-lockfile";
 import { DATA_DIR } from "@/lib/dataDir.js";
+import { initR2Db, uploadDbToR2 } from "@/lib/r2DbSync.js";
 
 const DEFAULT_MITM_ROUTER_BASE = "http://localhost:20128";
 const DB_FILE = path.join(DATA_DIR, "db.json");
@@ -167,10 +168,12 @@ async function safeRead(db) {
 
 async function safeWrite(db) {
   await withFileLock(db, () => db.write());
+  await uploadDbToR2(DB_FILE);
 }
 
 export async function getDb() {
   if (!dbInstance) {
+    await initR2Db(DB_FILE);
     dbInstance = new Low(new JSONFile(DB_FILE), cloneDefaultData());
   }
 
