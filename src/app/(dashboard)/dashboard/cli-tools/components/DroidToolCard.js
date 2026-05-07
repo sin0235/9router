@@ -3,7 +3,8 @@
 import { useState, useEffect, useRef } from "react";
 import { Card, Button, ModelSelectModal, ManualConfigModal } from "@/shared/components";
 import Image from "next/image";
-import EndpointPresetControl from "./EndpointPresetControl";
+import BaseUrlSelect from "./BaseUrlSelect";
+import { matchKnownEndpoint } from "./cliEndpointMatch";
 
 const CLOUD_URL = process.env.NEXT_PUBLIC_CLOUD_URL;
 
@@ -17,6 +18,10 @@ export default function DroidToolCard({
   activeProviders,
   cloudEnabled,
   initialStatus,
+  tunnelEnabled,
+  tunnelPublicUrl,
+  tailscaleEnabled,
+  tailscaleUrl,
 }) {
   const [droidStatus, setDroidStatus] = useState(initialStatus || null);
   const [checkingDroid, setCheckingDroid] = useState(false);
@@ -38,11 +43,7 @@ export default function DroidToolCard({
     // Check for any 9Router model entry (support multi-model: custom:9Router-0, custom:9Router-1, ...)
     const currentConfig = droidStatus.settings?.customModels?.find(m => m.id?.startsWith("custom:9Router"));
     if (!currentConfig) return "not_configured";
-    const localMatch = currentConfig.baseUrl?.includes("localhost") || currentConfig.baseUrl?.includes("127.0.0.1");
-    const cloudMatch = cloudEnabled && CLOUD_URL && currentConfig.baseUrl?.startsWith(CLOUD_URL);
-    const tunnelMatch = baseUrl && currentConfig.baseUrl?.startsWith(baseUrl);
-    if (localMatch || cloudMatch || tunnelMatch) return "configured";
-    return "other";
+    return matchKnownEndpoint(currentConfig.baseUrl, { tunnelPublicUrl, tailscaleUrl, cloudUrl: cloudEnabled ? CLOUD_URL : null }) ? "configured" : "other";
   };
 
   const configStatus = getConfigStatus();
@@ -287,7 +288,22 @@ export default function DroidToolCard({
           {!checkingDroid && droidStatus?.installed && (
             <>
               <div className="flex flex-col gap-2">
-                {/* Current Base URL */}
+                {/* Endpoint (selector) */}
+                <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-[8rem_auto_1fr] sm:items-center sm:gap-2">
+                  <span className="text-xs font-semibold text-text-main sm:text-right sm:text-sm">Select Endpoint</span>
+                  <span className="material-symbols-outlined hidden text-text-muted text-[14px] sm:inline">arrow_forward</span>
+                  <BaseUrlSelect
+                    value={customBaseUrl || getDisplayUrl()}
+                    onChange={setCustomBaseUrl}
+                    requiresExternalUrl={tool.requiresExternalUrl}
+                    tunnelEnabled={tunnelEnabled}
+                    tunnelPublicUrl={tunnelPublicUrl}
+                    tailscaleEnabled={tailscaleEnabled}
+                    tailscaleUrl={tailscaleUrl}
+                  />
+                </div>
+
+                {/* Current configured */}
                 {droidStatus?.settings?.customModels?.find(m => m.id?.startsWith("custom:9Router"))?.baseUrl && (
                   <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-[8rem_auto_1fr_auto] sm:items-center sm:gap-2">
                     <span className="text-xs font-semibold text-text-main sm:text-right sm:text-sm">Current</span>
@@ -297,31 +313,6 @@ export default function DroidToolCard({
                     </span>
                   </div>
                 )}
-
-                <EndpointPresetControl
-                  baseUrl={getDisplayUrl()}
-                  apiKey={selectedApiKey}
-                  onBaseUrlChange={setCustomBaseUrl}
-                  onApiKeyChange={setSelectedApiKey}
-                />
-
-                {/* Base URL */}
-                <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-[8rem_auto_1fr_auto] sm:items-center sm:gap-2">
-                  <span className="text-xs font-semibold text-text-main sm:text-right sm:text-sm">Base URL</span>
-                  <span className="material-symbols-outlined hidden text-text-muted text-[14px] sm:inline">arrow_forward</span>
-                  <input
-                    type="text"
-                    value={getDisplayUrl()}
-                    onChange={(e) => setCustomBaseUrl(e.target.value)}
-                    placeholder="https://.../v1"
-                    className="w-full min-w-0 px-2 py-2 bg-surface rounded border border-border text-xs focus:outline-none focus:ring-1 focus:ring-primary/50 sm:py-1.5"
-                  />
-                  {customBaseUrl && customBaseUrl !== baseUrl && (
-                    <button onClick={() => setCustomBaseUrl("")} className="p-1 text-text-muted hover:text-primary rounded transition-colors" title="Reset to default">
-                      <span className="material-symbols-outlined text-[14px]">restart_alt</span>
-                    </button>
-                  )}
-                </div>
 
                 {/* API Key */}
                 <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-[8rem_auto_1fr_auto] sm:items-center sm:gap-2">
