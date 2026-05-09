@@ -4,25 +4,34 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 const DEFAULT_DB_KEY = "db.json";
+const DEFAULT_SQLITE_DB_KEY = "data.sqlite";
 const ENCRYPTED_DB_PREFIX = "9router-db-v1";
 
 let client = null;
-let initPromise = null;
+const initPromises = new Map();
 let uploadQueue = Promise.resolve();
 
-function getConfig() {
+function hasExplicitKey() {
+  return Boolean(process.env.R2_DB_KEY || process.env.R2_OBJECT_KEY);
+}
+
+function defaultKeyForPath(localPath) {
+  return localPath?.endsWith(".sqlite") ? DEFAULT_SQLITE_DB_KEY : DEFAULT_DB_KEY;
+}
+
+function getConfig(localPath) {
   const accountId = process.env.R2_ACCOUNT_ID;
   const accessKeyId = process.env.R2_ACCESS_KEY_ID;
   const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
   const bucket = process.env.R2_BUCKET;
-  const key = process.env.R2_DB_KEY || process.env.R2_OBJECT_KEY || DEFAULT_DB_KEY;
+  const key = process.env.R2_DB_KEY || process.env.R2_OBJECT_KEY || defaultKeyForPath(localPath);
   const endpoint = process.env.R2_ENDPOINT || (accountId ? `https://${accountId}.r2.cloudflarestorage.com` : "");
 
   return { accountId, accessKeyId, secretAccessKey, bucket, key, endpoint };
 }
 
-export function isR2DbEnabled() {
-  const { accountId, accessKeyId, secretAccessKey, bucket, key, endpoint } = getConfig();
+export function isR2DbEnabled(localPath) {
+  const { accountId, accessKeyId, secretAccessKey, bucket, key, endpoint } = getConfig(localPath);
   return Boolean(accountId && accessKeyId && secretAccessKey && bucket && key && endpoint);
 }
 
@@ -114,19 +123,41 @@ function decryptDb(buffer) {
   ]);
 }
 
+function validateDownloadedDb(localPath, body) {
+  if (localPath?.endsWith(".sqlite")) {
+    const header = body.subarray(0, 16).toString("binary");
+    if (header !== "SQLite format 3\0") {
+      throw new Error("downloaded object is not a SQLite database");
+    }
+    return;
+  }
+
+  JSON.parse(body.toString("utf8"));
+}
+
+function getContentType(localPath) {
+  return localPath?.endsWith(".sqlite") ? "application/vnd.sqlite3" : "application/json";
+}
+
+export function hasExplicitR2DbKey() {
+  return hasExplicitKey();
+}
+
 export async function initR2Db(localPath) {
-  if (!isR2DbEnabled()) return;
-  if (!initPromise) initPromise = downloadDbFromR2(localPath);
-  await initPromise;
+  if (!isR2DbEnabled(localPath)) return;
+  const { bucket, key } = getConfig(localPath);
+  const initKey = `${bucket}/${key}->${localPath}`;
+  if (!initPromises.has(initKey)) initPromises.set(initKey, downloadDbFromR2(localPath));
+  await initPromises.get(initKey);
 }
 
 async function downloadDbFromR2(localPath) {
-  const { bucket, key } = getConfig();
+  const { bucket, key } = getConfig(localPath);
 
   try {
     const response = await getClient().send(new GetObjectCommand({ Bucket: bucket, Key: key }));
     const body = decryptDb(await streamToBuffer(response.Body));
-    JSON.parse(body.toString("utf8"));
+    validateDownloadedDb(localPath, body);
     await fs.mkdir(path.dirname(localPath), { recursive: true });
     await fs.writeFile(localPath, body);
     console.log(`[R2 DB] Downloaded ${bucket}/${key} to local db`);
@@ -140,7 +171,7 @@ async function downloadDbFromR2(localPath) {
 }
 
 export async function uploadDbToR2(localPath) {
-  if (!isR2DbEnabled()) return;
+  if (!isR2DbEnabled(localPath)) return;
 
   uploadQueue = uploadQueue
     .catch(() => {})
@@ -150,7 +181,7 @@ export async function uploadDbToR2(localPath) {
 }
 
 async function uploadDbFile(localPath) {
-  const { bucket, key } = getConfig();
+  const { bucket, key } = getConfig(localPath);
 
   try {
     const body = encryptDb(await fs.readFile(localPath));
@@ -158,7 +189,7 @@ async function uploadDbFile(localPath) {
       Bucket: bucket,
       Key: key,
       Body: body,
-      ContentType: "application/json",
+      ContentType: getContentType(localPath),
       Metadata: getEncryptionKey() ? { encrypted: ENCRYPTED_DB_PREFIX } : undefined,
     }));
     console.log(`[R2 DB] Uploaded local db to ${bucket}/${key}`);
