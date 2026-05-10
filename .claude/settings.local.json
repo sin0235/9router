@@ -3,7 +3,9 @@
     "allow": [
       "PowerShell(node --input-type=module -e \"import\\('./src/lib/r2DbSync.js'\\).then\\(\\(\\) => console.log\\('ok'\\)\\)\")",
       "Skill(investigate)",
-      "PowerShell(Join-Path *)"
+      "PowerShell(Join-Path *)",
+      "PowerShell(npm run *)",
+      "PowerShell($env:NODE_ENV='production'; npx next build --webpack)"
     ]
   }
 }

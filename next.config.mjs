@@ -6,6 +6,9 @@ const nextConfig = {
     unoptimized: true
   },
   env: {},
+  experimental: {
+    cpus: 1
+  },
   webpack: (config, { isServer }) => {
     // Ignore fs/path modules in browser bundle
     if (!isServer) {
