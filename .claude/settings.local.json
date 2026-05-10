@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "PowerShell(node --input-type=module -e \"import\\('./src/lib/r2DbSync.js'\\).then\\(\\(\\) => console.log\\('ok'\\)\\)\")"
+      "PowerShell(node --input-type=module -e \"import\\('./src/lib/r2DbSync.js'\\).then\\(\\(\\) => console.log\\('ok'\\)\\)\")",
+      "Skill(investigate)",
+      "PowerShell(Join-Path *)"
     ]
   }
 }
