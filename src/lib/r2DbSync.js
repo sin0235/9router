@@ -4,7 +4,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 const DEFAULT_DB_KEY = "db.json";
-const DEFAULT_SQLITE_DB_KEY = "data.sqlite";
 const ENCRYPTED_DB_PREFIX = "9router-db-v1";
 
 let client = null;
@@ -15,11 +14,7 @@ function hasExplicitKey() {
   return Boolean(process.env.R2_DB_KEY || process.env.R2_OBJECT_KEY);
 }
 
-function defaultKeyForPath(localPath) {
-  return localPath?.endsWith(".sqlite") ? DEFAULT_SQLITE_DB_KEY : DEFAULT_DB_KEY;
-}
-
-function getConfig(localPath) {
+function getConfig(_localPath) {
   const accountId = process.env.R2_ACCOUNT_ID;
   const accessKeyId = process.env.R2_ACCESS_KEY_ID;
   const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
@@ -123,20 +118,12 @@ function decryptDb(buffer) {
   ]);
 }
 
-function validateDownloadedDb(localPath, body) {
-  if (localPath?.endsWith(".sqlite")) {
-    const header = body.subarray(0, 16).toString("binary");
-    if (header !== "SQLite format 3\0") {
-      throw new Error("downloaded object is not a SQLite database");
-    }
-    return;
-  }
-
+function validateDownloadedDb(_localPath, body) {
   JSON.parse(body.toString("utf8"));
 }
 
-function getContentType(localPath) {
-  return localPath?.endsWith(".sqlite") ? "application/vnd.sqlite3" : "application/json";
+function getContentType() {
+  return "application/json";
 }
 
 export function hasExplicitR2DbKey() {
@@ -158,9 +145,15 @@ async function downloadDbFromR2(localPath) {
     const response = await getClient().send(new GetObjectCommand({ Bucket: bucket, Key: key }));
     const body = decryptDb(await streamToBuffer(response.Body));
     validateDownloadedDb(localPath, body);
+
+    if (localPath?.endsWith(".sqlite")) {
+      console.log(`[R2 DB] Portable backup ${bucket}/${key} available; SQLite overwrite skipped`);
+      return;
+    }
+
     await fs.mkdir(path.dirname(localPath), { recursive: true });
     await fs.writeFile(localPath, body);
-    console.log(`[R2 DB] Downloaded ${bucket}/${key} to local db`);
+    console.log(`[R2 DB] Downloaded ${bucket}/${key} to local backup json`);
   } catch (error) {
     if (isMissingObjectError(error)) {
       console.warn(`[R2 DB] Object ${bucket}/${key} not found; using local db`);
@@ -184,15 +177,23 @@ async function uploadDbFile(localPath) {
   const { bucket, key } = getConfig(localPath);
 
   try {
-    const body = encryptDb(await fs.readFile(localPath));
+    let payload;
+    if (localPath?.endsWith(".sqlite")) {
+      const { exportDb } = await import("@/lib/db/index.js");
+      payload = Buffer.from(JSON.stringify(await exportDb()));
+    } else {
+      payload = await fs.readFile(localPath);
+    }
+
+    const body = encryptDb(payload);
     await getClient().send(new PutObjectCommand({
       Bucket: bucket,
       Key: key,
       Body: body,
-      ContentType: getContentType(localPath),
+      ContentType: getContentType(),
       Metadata: getEncryptionKey() ? { encrypted: ENCRYPTED_DB_PREFIX } : undefined,
     }));
-    console.log(`[R2 DB] Uploaded local db to ${bucket}/${key}`);
+    console.log(`[R2 DB] Uploaded portable backup to ${bucket}/${key}`);
   } catch (error) {
     console.warn(`[R2 DB] Upload failed for ${bucket}/${key}: ${error.message}`);
   }
