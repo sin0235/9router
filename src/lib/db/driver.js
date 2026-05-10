@@ -1,9 +1,11 @@
 import { ensureDirs, DATA_FILE, LEGACY_FILES } from "./paths.js";
-import { initR2Db, uploadDbToR2 } from "@/lib/r2DbSync.js";
+import { initR2Db, uploadDbToR2, syncR2WithLocal } from "@/lib/r2DbSync.js";
 
 // Use global to survive Next.js dev hot-reload (module state resets on reload)
-if (!global._dbAdapter) global._dbAdapter = { instance: null, initPromise: null, logged: false };
+if (!global._dbAdapter) global._dbAdapter = { instance: null, initPromise: null, logged: false, syncInterval: null };
 const state = global._dbAdapter;
+
+const R2_SYNC_INTERVAL_MS = 30000; // Pull from R2 every 30 seconds
 
 async function tryBunSqlite() {
   // Bun runtime only — built-in, no install needed
@@ -78,7 +80,20 @@ async function initAdapter() {
 
   const syncedAdapter = withR2Sync(adapter);
   state.instance = syncedAdapter;
+  
+  // 1. Initial Pull: Ensure we have the latest from cloud before we push any local changes (like migrations)
+  await syncR2WithLocal(DATA_FILE);
+
+  // 2. Initial Push: Upload current state
   void uploadDbToR2(DATA_FILE);
+
+  // Setup periodic R2 sync (pull newer data from cloud)
+  if (!state.syncInterval) {
+    state.syncInterval = setInterval(() => {
+      void syncR2WithLocal(DATA_FILE);
+    }, R2_SYNC_INTERVAL_MS);
+  }
+
   return syncedAdapter;
 }
 

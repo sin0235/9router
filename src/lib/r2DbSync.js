@@ -1,14 +1,18 @@
-import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { GetObjectCommand, PutObjectCommand, S3Client, HeadObjectCommand } from "@aws-sdk/client-s3";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
 const DEFAULT_DB_KEY = "db.json";
 const ENCRYPTED_DB_PREFIX = "9router-db-v1";
+const SYNC_STATE = {
+  lastRemoteETag: null,
+  isPulling: false,
+};
 
 let client = null;
 const initPromises = new Map();
-let uploadQueue = Promise.resolve();
+let syncQueue = Promise.resolve();
 
 function hasExplicitKey() {
   return Boolean(process.env.R2_DB_KEY || process.env.R2_OBJECT_KEY);
@@ -151,10 +155,16 @@ async function downloadDbFromR2(localPath) {
     validateDownloadedDb(localPath, body);
 
     if (localPath?.endsWith(".sqlite")) {
-      console.log(`[R2 DB] Portable backup ${bucket}/${key} available; SQLite overwrite skipped`);
+      // For SQLite, we don't update lastRemoteETag here because we haven't imported it into the active DB yet.
+      // We write it to a legacy json path so migrate.js can find it if the DB is fresh.
+      const jsonPath = localPath.replace(".sqlite", ".json").replace(path.join("db", "data"), "db");
+      await fs.mkdir(path.dirname(jsonPath), { recursive: true });
+      await fs.writeFile(jsonPath, body);
+      console.log(`[R2 DB] Downloaded ${bucket}/${key} to portable backup ${jsonPath}`);
       return;
     }
 
+    SYNC_STATE.lastRemoteETag = response.ETag;
     await fs.mkdir(path.dirname(localPath), { recursive: true });
     await fs.writeFile(localPath, body);
     console.log(`[R2 DB] Downloaded ${bucket}/${key} to local backup json`);
@@ -170,11 +180,14 @@ async function downloadDbFromR2(localPath) {
 export async function uploadDbToR2(localPath) {
   if (!isR2DbEnabled(localPath)) return;
 
-  uploadQueue = uploadQueue
+  syncQueue = syncQueue
     .catch(() => {})
-    .then(() => uploadDbFile(localPath));
+    .then(() => {
+      if (SYNC_STATE.isPulling) return;
+      return uploadDbFile(localPath);
+    });
 
-  await uploadQueue;
+  return syncQueue;
 }
 
 async function uploadDbFile(localPath) {
@@ -190,15 +203,88 @@ async function uploadDbFile(localPath) {
     }
 
     const body = encryptDb(payload);
-    await getClient().send(new PutObjectCommand({
+    const response = await getClient().send(new PutObjectCommand({
       Bucket: bucket,
       Key: key,
       Body: body,
       ContentType: getContentType(),
       Metadata: getEncryptionKey() ? { encrypted: ENCRYPTED_DB_PREFIX } : undefined,
     }));
+
+    SYNC_STATE.lastRemoteETag = response.ETag;
     console.log(`[R2 DB] Uploaded portable backup to ${bucket}/${key}`);
   } catch (error) {
     console.warn(`[R2 DB] Upload failed for ${bucket}/${key}: ${error.message}`);
   }
+}
+
+/**
+ * Real-time sync: Pull updates from R2 if remote ETag has changed.
+ */
+export async function syncR2WithLocal(localPath) {
+  if (!isR2DbEnabled(localPath)) return;
+
+  syncQueue = syncQueue
+    .catch(() => {})
+    .then(async () => {
+      if (SYNC_STATE.isPulling) return;
+      const { bucket, key } = getConfig(localPath);
+
+      try {
+        SYNC_STATE.isPulling = true;
+        
+        // 1. Check metadata for ETag change
+        const head = await getClient().send(new HeadObjectCommand({ Bucket: bucket, Key: key })).catch(e => {
+          if (isMissingObjectError(e)) return null;
+          throw e;
+        });
+
+        if (!head || head.ETag === SYNC_STATE.lastRemoteETag) {
+          return;
+        }
+
+        console.log(`[R2 DB] Remote change detected (${head.ETag}), pulling...`);
+
+        // 2. Download and decrypt
+        const abortController = new AbortController();
+        const timeout = setTimeout(() => abortController.abort(), 30000);
+
+        try {
+          const response = await getClient().send(new GetObjectCommand({ 
+            Bucket: bucket, 
+            Key: key,
+            Signal: abortController.signal
+          }));
+          const body = decryptDb(await streamToBuffer(response.Body));
+          validateDownloadedDb(localPath, body);
+          
+          const payload = JSON.parse(body.toString("utf8"));
+
+          // Sanity check: Ensure payload is a valid 9router DB export
+          if (!payload.settings && !payload.providerConnections && !payload.modelAliases) {
+            console.warn(`[R2 DB] Pull aborted: Downloaded payload from ${bucket}/${key} seems empty or invalid`);
+            return;
+          }
+
+          // 3. Import into local DB (handles merging/overwriting)
+          if (localPath?.endsWith(".sqlite")) {
+            const { importDb } = await import("@/lib/db/index.js");
+            await importDb(payload);
+          }
+
+          SYNC_STATE.lastRemoteETag = response.ETag;
+          console.log(`[R2 DB] Real-time sync complete: Pulled from ${bucket}/${key}`);
+        } finally {
+          clearTimeout(timeout);
+        }
+      } catch (error) {
+        if (!isMissingObjectError(error)) {
+          console.warn(`[R2 DB] Real-time sync pull failed: ${error.message}`);
+        }
+      } finally {
+        SYNC_STATE.isPulling = false;
+      }
+    });
+
+  return syncQueue;
 }
