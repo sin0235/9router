@@ -8,6 +8,7 @@ const ENCRYPTED_DB_PREFIX = "9router-db-v1";
 const SYNC_STATE = {
   lastRemoteETag: null,
   isPulling: false,
+  pendingUpload: false,
 };
 
 let client = null;
@@ -155,11 +156,12 @@ async function downloadDbFromR2(localPath) {
     validateDownloadedDb(localPath, body);
 
     if (localPath?.endsWith(".sqlite")) {
-      // For SQLite, we don't update lastRemoteETag here because we haven't imported it into the active DB yet.
-      // We write it to a legacy json path so migrate.js can find it if the DB is fresh.
+      // Write to legacy json path so migrate.js can find it if the DB is fresh.
       const jsonPath = localPath.replace(".sqlite", ".json").replace(path.join("db", "data"), "db");
       await fs.mkdir(path.dirname(jsonPath), { recursive: true });
       await fs.writeFile(jsonPath, body);
+      // Track ETag so uploadDbFile can detect if remote changes before our next upload
+      SYNC_STATE.lastRemoteETag = response.ETag;
       console.log(`[R2 DB] Downloaded ${bucket}/${key} to portable backup ${jsonPath}`);
       return;
     }
@@ -194,6 +196,20 @@ async function uploadDbFile(localPath) {
   const { bucket, key } = getConfig(localPath);
 
   try {
+    // Guard: if remote has newer data than we've seen, defer upload to avoid overwriting it.
+    // The sync pull will happen on the next interval; pendingUpload ensures we re-upload afterward.
+    if (SYNC_STATE.lastRemoteETag !== null) {
+      const remoteHead = await getClient().send(new HeadObjectCommand({ Bucket: bucket, Key: key })).catch(e => {
+        if (isMissingObjectError(e)) return null;
+        throw e;
+      });
+      if (remoteHead?.ETag && remoteHead.ETag !== SYNC_STATE.lastRemoteETag) {
+        SYNC_STATE.pendingUpload = true;
+        console.warn(`[R2 DB] Upload deferred: remote has newer data (${remoteHead.ETag}). Will upload after pull.`);
+        return;
+      }
+    }
+
     let payload;
     if (localPath?.endsWith(".sqlite")) {
       const { exportDb } = await import("@/lib/db/index.js");
@@ -250,14 +266,32 @@ export async function syncR2WithLocal(localPath) {
         const timeout = setTimeout(() => abortController.abort(), 30000);
 
         try {
-          const response = await getClient().send(new GetObjectCommand({ 
-            Bucket: bucket, 
-            Key: key,
-            Signal: abortController.signal
-          }));
-          const body = decryptDb(await streamToBuffer(response.Body));
+          const response = await getClient().send(
+            new GetObjectCommand({ Bucket: bucket, Key: key }),
+            { abortSignal: abortController.signal }
+          );
+
+          let body;
+          try {
+            body = decryptDb(await streamToBuffer(response.Body));
+          } catch (decryptError) {
+            if (decryptError.message.includes("DB_ENCRYPTION_KEY is required")) {
+              console.error(`[R2 DB] CRITICAL: Remote data at ${bucket}/${key} is encrypted, but DB_ENCRYPTION_KEY is not set on this machine. Sync disabled to prevent data loss.`);
+              SYNC_STATE.lastRemoteETag = response.ETag;
+              return;
+            }
+            if (
+              decryptError.message.includes("Unsupported state or unable to authenticate data") ||
+              decryptError.message.includes("unable to authenticate data")
+            ) {
+              console.error(`[R2 DB] Decryption failed for ${bucket}/${key}: auth tag mismatch. DB_ENCRYPTION_KEY mismatch or data corrupted. Sync paused until remote data changes.`);
+              SYNC_STATE.lastRemoteETag = response.ETag;
+              return;
+            }
+            throw decryptError;
+          }
+
           validateDownloadedDb(localPath, body);
-          
           const payload = JSON.parse(body.toString("utf8"));
 
           // Sanity check: Ensure payload is a valid 9router DB export
@@ -274,6 +308,12 @@ export async function syncR2WithLocal(localPath) {
 
           SYNC_STATE.lastRemoteETag = response.ETag;
           console.log(`[R2 DB] Real-time sync complete: Pulled from ${bucket}/${key}`);
+
+          // If an upload was deferred while waiting for this pull, send it now
+          if (SYNC_STATE.pendingUpload) {
+            SYNC_STATE.pendingUpload = false;
+            await uploadDbFile(localPath);
+          }
         } finally {
           clearTimeout(timeout);
         }
