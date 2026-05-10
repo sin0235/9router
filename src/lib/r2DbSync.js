@@ -14,7 +14,11 @@ function hasExplicitKey() {
   return Boolean(process.env.R2_DB_KEY || process.env.R2_OBJECT_KEY);
 }
 
-function getConfig(_localPath) {
+function defaultKeyForPath(_localPath) {
+  return DEFAULT_DB_KEY;
+}
+
+function getConfig(localPath) {
   const accountId = process.env.R2_ACCOUNT_ID;
   const accessKeyId = process.env.R2_ACCESS_KEY_ID;
   const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;

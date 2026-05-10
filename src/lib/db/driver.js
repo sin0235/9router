@@ -75,8 +75,11 @@ async function initAdapter() {
   const { runMigrationOnce } = await import("./migrate.js");
   await runMigrationOnce(adapter);
   adapter.checkpoint?.();
-  await uploadDbToR2(DATA_FILE);
-  return withR2Sync(adapter);
+
+  const syncedAdapter = withR2Sync(adapter);
+  state.instance = syncedAdapter;
+  void uploadDbToR2(DATA_FILE);
+  return syncedAdapter;
 }
 
 function withR2Sync(adapter) {
