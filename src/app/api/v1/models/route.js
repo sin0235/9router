@@ -169,6 +169,23 @@ export async function buildModelsList(kindFilter) {
 
   const models = [];
 
+  for (const [providerId, providerInfo] of Object.entries(AI_PROVIDERS)) {
+    if (!providerInfo?.noAuth || activeConnectionByProvider.has(providerId)) continue;
+    if (!providerMatchesKinds(providerId, kindFilter)) continue;
+
+    const alias = getProviderAlias(providerId) || PROVIDER_ID_TO_ALIAS[providerId] || providerId;
+    const providerModels = PROVIDER_MODELS[alias] || [];
+    for (const model of providerModels) {
+      if (!kindFilter.includes(modelKind(model))) continue;
+      if (isDisabled(alias, model.id)) continue;
+      models.push({
+        id: `${alias}/${model.id}`,
+        object: "model",
+        owned_by: alias,
+      });
+    }
+  }
+
   // Combos first (filtered by kind). Web combos expose `kind` so AI knows search vs fetch.
   for (const combo of combos) {
     if (!comboMatchesKinds(combo, kindFilter)) continue;
