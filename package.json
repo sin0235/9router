@@ -3,13 +3,10 @@
   "version": "0.4.28",
   "description": "9Router web dashboard",
   "private": true,
-  "engines": {
-    "node": "22.x"
-  },
   "scripts": {
     "dev": "next dev --webpack --port 20128",
-    "build": "NODE_ENV=production NEXT_PRIVATE_BUILD_WORKER_COUNT=1 next build --webpack",
-    "start": "NODE_ENV=production node .next/standalone/server.js",
+    "build": "NODE_ENV=production next build --webpack",
+    "start": "NODE_ENV=production next start",
     "deploy:global": "powershell -ExecutionPolicy Bypass -File scripts/deploy-npm-global.ps1",
     "dev:bun": "bun --bun next dev --webpack --port 20128",
     "build:bun": "NODE_ENV=production bun --bun next build --webpack",
