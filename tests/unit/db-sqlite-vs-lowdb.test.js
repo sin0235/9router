@@ -236,15 +236,16 @@ describe("DB SQLite layer — public API parity", () => {
     expect(Array.isArray(exported.providerConnections)).toBe(true);
     expect(typeof exported.modelAliases).toBe("object");
 
-    // Add marker, export, import a different payload, verify reset
-    await sqliteDb.setModelAlias("marker", "before");
+    await sqliteDb.setModelAlias("remote-marker", "before");
     const snap = await sqliteDb.exportDb();
 
-    await sqliteDb.setModelAlias("marker", "after");
-    expect((await sqliteDb.getModelAliases()).marker).toBe("after");
+    await sqliteDb.setModelAlias("local-marker", "after");
+    expect((await sqliteDb.getModelAliases())["local-marker"]).toBe("after");
 
     await sqliteDb.importDb(snap);
-    expect((await sqliteDb.getModelAliases()).marker).toBe("before");
+    const aliases = await sqliteDb.getModelAliases();
+    expect(aliases["remote-marker"]).toBe("before");
+    expect(aliases["local-marker"]).toBe("after");
   });
 
   it("pricing: user pricing merged with constants", async () => {
