@@ -303,7 +303,7 @@ export async function syncR2WithLocal(localPath) {
           // 3. Import into local DB (handles merging/overwriting)
           if (localPath?.endsWith(".sqlite")) {
             const { importDb } = await import("@/lib/db/index.js");
-            await importDb(payload);
+            await importDb(payload, { source: "sync" });
           }
 
           SYNC_STATE.lastRemoteETag = response.ETag;

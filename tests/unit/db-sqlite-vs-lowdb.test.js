@@ -17,7 +17,9 @@ beforeAll(async () => {
   await sqliteDb.initDb();
 });
 
-afterAll(() => {
+afterAll(async () => {
+  const { closeAdapterForTests } = await import("@/lib/db/driver.js");
+  closeAdapterForTests();
   if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
   if (originalDataDir === undefined) delete process.env.DATA_DIR;
   else process.env.DATA_DIR = originalDataDir;
@@ -246,6 +248,73 @@ describe("DB SQLite layer — public API parity", () => {
     const aliases = await sqliteDb.getModelAliases();
     expect(aliases["remote-marker"]).toBe("before");
     expect(aliases["local-marker"]).toBe("after");
+  });
+
+  it("importDb preserves auth settings from stale legacy payloads", async () => {
+    await sqliteDb.updateSettings({
+      requireLogin: true,
+      authMode: "password",
+      tunnelDashboardAccess: true,
+      oidcIssuerUrl: "",
+      cloudEnabled: false,
+      localOnlySetting: "keep",
+    });
+
+    await sqliteDb.importDb({
+      settings: {
+        requireLogin: false,
+        authMode: "oidc",
+        tunnelDashboardAccess: false,
+        oidcIssuerUrl: "https://stale.example.com",
+        cloudEnabled: true,
+      },
+    }, { source: "sync" });
+
+    const settings = await sqliteDb.getSettings();
+    expect(settings.requireLogin).toBe(true);
+    expect(settings.authMode).toBe("password");
+    expect(settings.tunnelDashboardAccess).toBe(true);
+    expect(settings.oidcIssuerUrl).toBe("");
+    expect(settings.cloudEnabled).toBe(true);
+    expect(settings.localOnlySetting).toBe("keep");
+    expect(settings.__settingsUpdatedAt).toBeUndefined();
+  });
+
+  it("importDb accepts newer timestamped auth settings", async () => {
+    await sqliteDb.updateSettings({ authMode: "password", requireLogin: true });
+    const current = await sqliteDb.exportSettings();
+
+    await sqliteDb.importDb({
+      settings: {
+        authMode: "oidc",
+        requireLogin: false,
+        __settingsUpdatedAt: {
+          ...current.__settingsUpdatedAt,
+          authMode: "2999-01-01T00:00:00.000Z",
+          requireLogin: "2999-01-01T00:00:00.000Z",
+        },
+      },
+    }, { source: "sync" });
+
+    const settings = await sqliteDb.getSettings();
+    expect(settings.authMode).toBe("oidc");
+    expect(settings.requireLogin).toBe(false);
+  });
+
+  it("importDb updates existing KV aliases", async () => {
+    await sqliteDb.setModelAlias("conflict-alias", "local-model");
+    await sqliteDb.addCustomModel({ providerAlias: "conflict-provider", id: "model-a", type: "llm", name: "Local Model" });
+    await sqliteDb.setMitmAliasAll("conflict-tool", { "local-model": "local-target" });
+
+    await sqliteDb.importDb({
+      modelAliases: { "conflict-alias": "remote-model" },
+      customModels: [{ providerAlias: "conflict-provider", id: "model-a", type: "llm", name: "Remote Model" }],
+      mitmAlias: { "conflict-tool": { "remote-model": "remote-target" } },
+    });
+
+    expect((await sqliteDb.getModelAliases())["conflict-alias"]).toBe("remote-model");
+    expect((await sqliteDb.getCustomModels()).find((m) => m.providerAlias === "conflict-provider" && m.id === "model-a")?.name).toBe("Remote Model");
+    expect(await sqliteDb.getMitmAlias("conflict-tool")).toEqual({ "remote-model": "remote-target" });
   });
 
   it("pricing: user pricing merged with constants", async () => {

@@ -93,18 +93,19 @@ export async function exportDb() {
   return out;
 }
 
-export async function importDb(payload) {
+export async function importDb(payload, options = {}) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("Invalid database payload");
   }
   const db = await getAdapter();
   const now = new Date().toISOString();
 
-  db.transaction(() => {
-    if (payload.settings) {
-      db.run(`INSERT INTO settings(id, data) VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`, [stringifyJson(payload.settings)]);
-    }
+  if (payload.settings) {
+    const { importSettings } = await import("./repos/settingsRepo.js");
+    await importSettings(payload.settings, options);
+  }
 
+  db.transaction(() => {
     for (const c of payload.providerConnections || []) {
       const { id, provider, authType, name, email, priority, isActive, createdAt, updatedAt, ...rest } = c;
       db.run(
@@ -181,14 +182,14 @@ export async function importDb(payload) {
       );
     }
     for (const [a, m] of Object.entries(payload.modelAliases || {})) {
-      db.run(`INSERT INTO kv(scope, key, value) VALUES('modelAliases', ?, ?) ON CONFLICT(scope, key) DO NOTHING`, [a, stringifyJson(m)]);
+      db.run(`INSERT INTO kv(scope, key, value) VALUES('modelAliases', ?, ?) ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value`, [a, stringifyJson(m)]);
     }
     for (const m of payload.customModels || []) {
       const k = `${m.providerAlias}|${m.id}|${m.type || "llm"}`;
-      db.run(`INSERT INTO kv(scope, key, value) VALUES('customModels', ?, ?) ON CONFLICT(scope, key) DO NOTHING`, [k, stringifyJson(m)]);
+      db.run(`INSERT INTO kv(scope, key, value) VALUES('customModels', ?, ?) ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value`, [k, stringifyJson(m)]);
     }
     for (const [tool, mappings] of Object.entries(payload.mitmAlias || {})) {
-      db.run(`INSERT INTO kv(scope, key, value) VALUES('mitmAlias', ?, ?) ON CONFLICT(scope, key) DO NOTHING`, [tool, stringifyJson(mappings || {})]);
+      db.run(`INSERT INTO kv(scope, key, value) VALUES('mitmAlias', ?, ?) ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value`, [tool, stringifyJson(mappings || {})]);
     }
     for (const [provider, models] of Object.entries(payload.pricing || {})) {
       db.run(`INSERT INTO kv(scope, key, value) VALUES('pricing', ?, ?) ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value`, [provider, stringifyJson(models || {})]);

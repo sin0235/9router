@@ -17,7 +17,9 @@ beforeAll(async () => {
   await db.initDb();
 });
 
-afterAll(() => {
+afterAll(async () => {
+  const { closeAdapterForTests } = await import("@/lib/db/driver.js");
+  closeAdapterForTests();
   if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
   if (originalDataDir === undefined) delete process.env.DATA_DIR;
   else process.env.DATA_DIR = originalDataDir;

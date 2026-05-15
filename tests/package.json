@@ -13,5 +13,8 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "lowdb": "^7.0.1"
   }
 }
