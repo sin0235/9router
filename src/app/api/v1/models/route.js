@@ -13,6 +13,33 @@ const parseOpenAIStyleModels = (data) => {
   return data?.data || data?.models || data?.results || [];
 };
 
+const SUGGESTED_MODEL_FILTERS = {
+  "opencode-free": (models) => models
+    .filter((model) => model?.id?.endsWith("-free"))
+    .map((model) => ({ id: model.id, name: model.name || model.id })),
+};
+
+async function fetchSuggestedProviderModels(fetcher) {
+  if (!fetcher?.url || !fetcher?.type) return [];
+  const filter = SUGGESTED_MODEL_FILTERS[fetcher.type];
+  if (!filter) return [];
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const response = await fetch(fetcher.url, { cache: "no-store", signal: controller.signal });
+    clearTimeout(timeoutId);
+
+    if (!response.ok) return [];
+
+    const data = await response.json();
+    const rawModels = parseOpenAIStyleModels(data);
+    return filter(rawModels).filter((model) => typeof model.id === "string" && model.id.trim() !== "");
+  } catch {
+    return [];
+  }
+}
+
 // Matches provider IDs that are upstream/cross-instance connections (contain a UUID suffix)
 const UPSTREAM_CONNECTION_RE = /[-_][0-9a-f]{8,}$/i;
 
@@ -174,7 +201,8 @@ export async function buildModelsList(kindFilter) {
     if (!providerMatchesKinds(providerId, kindFilter)) continue;
 
     const alias = getProviderAlias(providerId) || PROVIDER_ID_TO_ALIAS[providerId] || providerId;
-    const providerModels = PROVIDER_MODELS[alias] || [];
+    const fetchedModels = await fetchSuggestedProviderModels(providerInfo.modelsFetcher);
+    const providerModels = fetchedModels.length > 0 ? fetchedModels : (PROVIDER_MODELS[alias] || []);
     for (const model of providerModels) {
       if (!kindFilter.includes(modelKind(model))) continue;
       if (isDisabled(alias, model.id)) continue;
