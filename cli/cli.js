@@ -219,8 +219,12 @@ function killAllAppProcesses(appPort) {
           });
           const lines = output.split("\n").slice(1).filter(l => l.trim());
           lines.forEach(line => {
-            const isAppProcess = line.toLowerCase().includes("9router") ||
-              line.toLowerCase().includes("next-server");
+            // Whitelist: real node process running 9router/cli.js, or next-server.
+            // Avoids killing editors/grep/strace/cursor that just have "9router" in cmdline.
+            const cmd = line.toLowerCase();
+            const isAppProcess =
+              (cmd.includes("node") && cmd.includes("9router") && (cmd.includes("cli.js") || cmd.includes("\\9router") || cmd.includes("/9router")))
+              || cmd.includes("next-server");
             if (isAppProcess) {
               const match = line.match(/^"(\d+)"/);
               if (match && match[1] && match[1] !== process.pid.toString()) {
@@ -241,7 +245,12 @@ function killAllAppProcesses(appPort) {
           const lines = output.split('\n');
 
           lines.forEach(line => {
-            const isAppProcess = line.includes("9router") || line.includes("next-server");
+            // Whitelist: real node process running 9router/cli.js, or next-server.
+            // Avoids killing grep/strace/editors/cursor that incidentally match "9router".
+            const cmd = line.toLowerCase();
+            const isAppProcess =
+              (cmd.includes("node") && cmd.includes("9router") && (cmd.includes("cli.js") || cmd.includes("/9router")))
+              || cmd.includes("next-server");
             if (isAppProcess) {
               const parts = line.trim().split(/\s+/);
               const pid = parts[1];
@@ -637,6 +646,10 @@ function startServer(latestVersion) {
 
   // Tray-only mode: no TUI, just tray icon
   if (trayMode) {
+    // Ignore SIGHUP so macOS terminal close doesn't kill the background tray process
+    process.removeAllListeners("SIGHUP");
+    process.on("SIGHUP", () => {});
+
     console.log(`\n🚀 ${pkg.name} v${pkg.version}`);
     console.log(`Server: http://${displayHost}:${port}`);
 
@@ -681,42 +694,29 @@ function startServer(latestVersion) {
           await startTerminalUI(port);
           // Loop continues, show menu again
         } else if (choice === "hide") {
-          // Hide to tray - spawn detached background process
+          // Hide to tray: keep the CURRENT process alive (it already owns a
+          // macOS GUI session so NSStatusItem works). Spawning a detached child
+          // puts it outside the login session → systray silently fails on macOS.
           const { clearScreen } = require("./src/cli/utils/display");
           clearScreen();
 
-          // Kill current tray FIRST so the new bgProcess can register a fresh
-          // NSStatusItem on macOS without conflicting with the orphan binary
-          try { require("./src/cli/tray/tray").killTray(); } catch (e) { }
-          await new Promise(r => setTimeout(r, 300));
+          // Survive terminal close — SIGHUP is sent when the launching shell exits
+          process.removeAllListeners("SIGHUP");
+          process.on("SIGHUP", () => {});
 
           // Enable auto startup on OS boot
           try {
             const { enableAutoStart } = require("./src/cli/tray/autostart");
-            const enabled = enableAutoStart(__filename);
-            if (enabled) {
-              console.log("✅ Auto-start enabled (will run on OS boot)");
-            }
+            enableAutoStart(__filename);
           } catch (e) { }
 
-          // Spawn new detached process with --tray flag
-          const bgProcess = spawn(process.execPath, [__filename, "--tray", "--skip-update", "-p", port.toString()], {
-            detached: true,
-            stdio: "ignore",
-            windowsHide: true,
-            env: { ...process.env }
-          });
-          bgProcess.unref();
-
-          console.log(`\n🔔 9Router is now running in background (PID: ${bgProcess.pid})`);
+          console.log(`\n🔔 9Router is running in tray (PID: ${process.pid})`);
           console.log(`   Server: http://${displayHost}:${port}`);
-          console.log(`\n💡 You can close this terminal. Right-click tray icon to:`);
-          console.log(`   • Open Dashboard`);
-          console.log(`   • Quit\n`);
+          console.log(`\n💡 You can close this terminal. Right-click tray icon to quit.\n`);
 
-          // Exit current process - background process takes over
-          cleanup();
-          process.exit(0);
+          // Tray icon already running (initTrayIcon was called above at startup).
+          // Nothing more to do — event loop keeps process alive via tray + server.
+          return;
         } else if (choice === "exit") {
           isShuttingDown = true;
           console.log("\nExiting...");

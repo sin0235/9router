@@ -1,3 +1,26 @@
+# v0.4.49 (2026-05-16)
+
+## Features
+- Add Kiro provider support: full request/response translation, live model listing, reasoning content support
+- Add `buildOutput` RTK filter with autodetect for npm/yarn/cargo build logs
+- Add MITM warning notification in tray and dashboard
+
+## Improvements
+- Add modalities (input/output) to model configuration for OpenCode
+- Fix tray hide-to-tray: keep current process alive instead of spawning detached child (fixes macOS NSStatusItem ghost icon)
+- Fix tray kill: graceful shutdown with SIGTERM/SIGKILL escalation
+- Fix SIGHUP handling so macOS terminal close doesn't kill tray process
+- Hide deprecated providers (qwen, iflow, antigravity)
+- Update i18n across 32 languages
+
+## Fixes
+- Fix model check (test-models) blocked by dashboardGuard: pass machineId-based CLI token in internal self-calls
+
+# v0.4.46 (2026-05-15)
+
+## Breaking Changes
+- Tunnel public URL changed — old tunnel links no longer work, please reconnect to get the new URL
+
 # v0.4.44 (2026-05-15)
 
 ## Features
