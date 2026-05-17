@@ -7,10 +7,14 @@ import { saveRequestDetail } from "@/lib/usageDb.js";
 
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
-  "Cache-Control": "no-cache",
+  "Cache-Control": "no-cache, no-transform",
   "Connection": "keep-alive",
-  "Access-Control-Allow-Origin": "*"
+  "Access-Control-Allow-Origin": "*",
+  "X-Accel-Buffering": "no"
 };
+
+const HEARTBEAT_INTERVAL_MS = 15000;
+const SSE_ENCODER = new TextEncoder();
 
 /**
  * Determine which SSE transform stream to use based on provider/format.
@@ -43,8 +47,96 @@ export function handleStreamingResponse({ providerResponse, provider, model, sou
   if (onRequestSuccess) onRequestSuccess();
 
   const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey });
-  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController);
+  const transformedBody = withHeartbeat(pipeWithDisconnect(providerResponse, transformStream, streamController), streamController);
 
+  persistStreamingStart({ provider, model, connectionId, body, stream, translatedBody, finalBody, requestStartTime });
+
+  return {
+    success: true,
+    response: new Response(transformedBody, { headers: SSE_HEADERS })
+  };
+}
+
+export function handleDeferredStreamingResponse({ executeProvider, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, streamController, onStreamComplete }) {
+  const responseBody = new ReadableStream({
+    async start(controller) {
+      let heartbeat = null;
+      const send = (text) => controller.enqueue(SSE_ENCODER.encode(text));
+      send(": connected\n\n");
+      heartbeat = setInterval(() => send(": ping\n\n"), HEARTBEAT_INTERVAL_MS);
+
+      try {
+        const result = await executeProvider();
+        const providerResponse = result.response;
+        if (!providerResponse?.ok) {
+          const status = providerResponse?.status || 502;
+          const text = providerResponse ? await providerResponse.text() : "Provider did not return a response.";
+          send(`event: error\ndata: ${JSON.stringify({ status, error: text })}\n\n`);
+          return;
+        }
+
+        if (onRequestSuccess) await onRequestSuccess();
+        const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey });
+        const transformed = providerResponse.body.pipeThrough(transformStream);
+        const reader = transformed.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          controller.enqueue(value);
+        }
+      } catch (error) {
+        send(`event: error\ndata: ${JSON.stringify({ error: error?.message || String(error) })}\n\n`);
+        streamController.handleError(error instanceof Error ? error : new Error(String(error)));
+      } finally {
+        if (heartbeat) clearInterval(heartbeat);
+        streamController.handleComplete();
+        controller.close();
+      }
+    },
+    cancel(reason) {
+      streamController.handleDisconnect(reason || "cancelled");
+    }
+  });
+
+  persistStreamingStart({ provider, model, connectionId, body, stream, translatedBody, finalBody, requestStartTime });
+
+  return {
+    success: true,
+    response: new Response(responseBody, { headers: SSE_HEADERS })
+  };
+}
+
+function withHeartbeat(readable, streamController) {
+  const reader = readable.getReader();
+  return new ReadableStream({
+    async start(controller) {
+      let heartbeat = null;
+      const send = (text) => controller.enqueue(SSE_ENCODER.encode(text));
+      send(": connected\n\n");
+      heartbeat = setInterval(() => send(": ping\n\n"), HEARTBEAT_INTERVAL_MS);
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          controller.enqueue(value);
+        }
+      } catch (error) {
+        streamController.handleError(error instanceof Error ? error : new Error(String(error)));
+        controller.error(error);
+        return;
+      } finally {
+        if (heartbeat) clearInterval(heartbeat);
+      }
+      controller.close();
+    },
+    cancel(reason) {
+      streamController.handleDisconnect(reason || "cancelled");
+      return reader.cancel(reason);
+    }
+  });
+}
+
+function persistStreamingStart({ provider, model, connectionId, body, stream, translatedBody, finalBody, requestStartTime }) {
   const streamDetailId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
   saveRequestDetail(buildRequestDetail({
     provider, model, connectionId,
@@ -58,11 +150,6 @@ export function handleStreamingResponse({ providerResponse, provider, model, sou
   }, { id: streamDetailId })).catch(err => {
     console.error("[RequestDetail] Failed to save streaming request:", err.message);
   });
-
-  return {
-    success: true,
-    response: new Response(transformedBody, { headers: SSE_HEADERS })
-  };
 }
 
 /**

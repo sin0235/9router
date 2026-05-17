@@ -14,7 +14,7 @@ import { getExecutor } from "../executors/index.js";
 import { buildRequestDetail, extractRequestConfig } from "./chatCore/requestDetail.js";
 import { handleForcedSSEToJson } from "./chatCore/sseToJsonHandler.js";
 import { handleNonStreamingResponse } from "./chatCore/nonStreamingHandler.js";
-import { handleStreamingResponse, buildOnStreamComplete } from "./chatCore/streamingHandler.js";
+import { handleStreamingResponse, handleDeferredStreamingResponse, buildOnStreamComplete } from "./chatCore/streamingHandler.js";
 import { detectClientTool, isNativePassthrough } from "../utils/clientDetector.js";
 import { dedupeTools } from "../utils/toolDeduper.js";
 import { injectCaveman } from "../rtk/caveman.js";
@@ -172,6 +172,26 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   if (proxyOptions.connectionProxyEnabled && proxyOptions.connectionNoProxy) {
     const connectionName = credentials?.connectionName || credentials?.connectionId || "unknown";
     log?.debug?.("PROXY", `${provider.toUpperCase()} | ${model} | conn=${connectionName} | no_proxy=${proxyOptions.connectionNoProxy}`);
+  }
+
+  if (stream && clientRequestedStreaming) {
+    const sharedCtx = { provider, model, body, stream, translatedBody, finalBody: null, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess };
+    const { onStreamComplete } = buildOnStreamComplete({ ...sharedCtx });
+    return handleDeferredStreamingResponse({
+      ...sharedCtx,
+      sourceFormat,
+      targetFormat,
+      userAgent,
+      reqLogger,
+      toolNameMap,
+      streamController,
+      onStreamComplete,
+      executeProvider: async () => {
+        const result = await executor.execute({ model, body: translatedBody, stream, credentials, signal: streamController.signal, log, proxyOptions });
+        reqLogger.logTargetRequest(result.url, result.headers, result.transformedBody);
+        return result;
+      }
+    });
   }
 
   // Execute request
