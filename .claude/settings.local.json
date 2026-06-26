@@ -5,7 +5,10 @@
       "Skill(investigate)",
       "PowerShell(Join-Path *)",
       "PowerShell(npm run *)",
-      "PowerShell($env:NODE_ENV='production'; npx next build --webpack)"
+      "PowerShell($env:NODE_ENV='production'; npx next build --webpack)",
+      "WebFetch(domain:appwrite.io)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
     ]
   }
 }
