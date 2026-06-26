@@ -2,6 +2,9 @@ import { GetObjectCommand, PutObjectCommand, S3Client, HeadObjectCommand } from 
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { initConsoleLogCapture } from "@/lib/consoleLogBuffer.js";
+
+initConsoleLogCapture();
 
 const DEFAULT_DB_KEY = "db.json";
 const ENCRYPTED_DB_PREFIX = "9router-db-v1";

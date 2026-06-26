@@ -1,5 +1,8 @@
 import { ensureDirs, DATA_FILE, LEGACY_FILES } from "./paths.js";
 import { initR2Db, uploadDbToR2, syncR2WithLocal } from "@/lib/r2DbSync.js";
+import { initConsoleLogCapture } from "@/lib/consoleLogBuffer.js";
+
+initConsoleLogCapture();
 
 // Use global to survive Next.js dev hot-reload (module state resets on reload)
 if (!global._dbAdapter) global._dbAdapter = { instance: null, initPromise: null, logged: false, syncInterval: null };
