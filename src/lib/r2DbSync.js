@@ -14,6 +14,7 @@ const SYNC_STATE = {
 let client = null;
 const initPromises = new Map();
 let syncQueue = Promise.resolve();
+let lastQueueError = null;
 
 function hasExplicitKey() {
   return Boolean(process.env.R2_DB_KEY || process.env.R2_OBJECT_KEY);
@@ -183,9 +184,19 @@ export async function uploadDbToR2(localPath) {
   if (!isR2DbEnabled(localPath)) return;
 
   syncQueue = syncQueue
-    .catch(() => {})
+    .catch((error) => {
+      const message = error?.message || String(error);
+      if (message !== lastQueueError) {
+        console.warn(`[R2 DB] Previous sync task failed: ${message}`);
+        lastQueueError = message;
+      }
+    })
     .then(() => {
-      if (SYNC_STATE.isPulling) return;
+      if (SYNC_STATE.isPulling) {
+        SYNC_STATE.pendingUpload = true;
+        console.warn("[R2 DB] Upload deferred: pull in progress. Will upload after pull.");
+        return;
+      }
       return uploadDbFile(localPath);
     });
 
@@ -228,9 +239,13 @@ async function uploadDbFile(localPath) {
     }));
 
     SYNC_STATE.lastRemoteETag = response.ETag;
+    SYNC_STATE.pendingUpload = false;
+    lastQueueError = null;
     console.log(`[R2 DB] Uploaded portable backup to ${bucket}/${key}`);
   } catch (error) {
+    SYNC_STATE.pendingUpload = true;
     console.warn(`[R2 DB] Upload failed for ${bucket}/${key}: ${error.message}`);
+    throw error;
   }
 }
 
@@ -241,21 +256,33 @@ export async function syncR2WithLocal(localPath) {
   if (!isR2DbEnabled(localPath)) return;
 
   syncQueue = syncQueue
-    .catch(() => {})
+    .catch((error) => {
+      const message = error?.message || String(error);
+      if (message !== lastQueueError) {
+        console.warn(`[R2 DB] Previous sync task failed: ${message}`);
+        lastQueueError = message;
+      }
+    })
     .then(async () => {
       if (SYNC_STATE.isPulling) return;
       const { bucket, key } = getConfig(localPath);
 
       try {
         SYNC_STATE.isPulling = true;
-        
+
         // 1. Check metadata for ETag change
         const head = await getClient().send(new HeadObjectCommand({ Bucket: bucket, Key: key })).catch(e => {
           if (isMissingObjectError(e)) return null;
           throw e;
         });
 
-        if (!head || head.ETag === SYNC_STATE.lastRemoteETag) {
+        if (!head) {
+          if (SYNC_STATE.pendingUpload) await uploadDbFile(localPath);
+          return;
+        }
+
+        if (head.ETag === SYNC_STATE.lastRemoteETag) {
+          if (SYNC_STATE.pendingUpload) await uploadDbFile(localPath);
           return;
         }
 
@@ -275,17 +302,15 @@ export async function syncR2WithLocal(localPath) {
           try {
             body = decryptDb(await streamToBuffer(response.Body));
           } catch (decryptError) {
-            if (decryptError.message.includes("DB_ENCRYPTION_KEY is required")) {
-              console.error(`[R2 DB] CRITICAL: Remote data at ${bucket}/${key} is encrypted, but DB_ENCRYPTION_KEY is not set on this machine. Sync disabled to prevent data loss.`);
-              SYNC_STATE.lastRemoteETag = response.ETag;
+            if (decryptError.message.includes("DB_ENCRYPTION_KEY")) {
+              console.error(`[R2 DB] CRITICAL: Remote data at ${bucket}/${key} is encrypted, but DB_ENCRYPTION_KEY is not set on this machine. Sync paused to prevent data loss.`);
               return;
             }
             if (
               decryptError.message.includes("Unsupported state or unable to authenticate data") ||
               decryptError.message.includes("unable to authenticate data")
             ) {
-              console.error(`[R2 DB] Decryption failed for ${bucket}/${key}: auth tag mismatch. DB_ENCRYPTION_KEY mismatch or data corrupted. Sync paused until remote data changes.`);
-              SYNC_STATE.lastRemoteETag = response.ETag;
+              console.error(`[R2 DB] Decryption failed for ${bucket}/${key}: auth tag mismatch. DB_ENCRYPTION_KEY mismatch or data corrupted. Sync remains paused until key is fixed or remote data changes.`);
               return;
             }
             throw decryptError;
@@ -310,10 +335,7 @@ export async function syncR2WithLocal(localPath) {
           console.log(`[R2 DB] Real-time sync complete: Pulled from ${bucket}/${key}`);
 
           // If an upload was deferred while waiting for this pull, send it now
-          if (SYNC_STATE.pendingUpload) {
-            SYNC_STATE.pendingUpload = false;
-            await uploadDbFile(localPath);
-          }
+          if (SYNC_STATE.pendingUpload) await uploadDbFile(localPath);
         } finally {
           clearTimeout(timeout);
         }
@@ -321,6 +343,7 @@ export async function syncR2WithLocal(localPath) {
         if (!isMissingObjectError(error)) {
           console.warn(`[R2 DB] Real-time sync pull failed: ${error.message}`);
         }
+        throw error;
       } finally {
         SYNC_STATE.isPulling = false;
       }

@@ -7,6 +7,12 @@ const state = global._dbAdapter;
 
 const R2_SYNC_INTERVAL_MS = 30000; // Pull from R2 every 30 seconds
 
+function queueUploadDbToR2() {
+  void uploadDbToR2(DATA_FILE).catch((error) => {
+    console.warn(`[R2 DB] Queued upload failed: ${error.message}`);
+  });
+}
+
 async function tryBunSqlite() {
   // Bun runtime only — built-in, no install needed
   if (!process.versions.bun) return null;
@@ -85,12 +91,14 @@ async function initAdapter() {
   await syncR2WithLocal(DATA_FILE);
 
   // 2. Initial Push: Upload current state
-  void uploadDbToR2(DATA_FILE);
+  queueUploadDbToR2();
 
   // Setup periodic R2 sync (pull newer data from cloud)
   if (!state.syncInterval) {
     state.syncInterval = setInterval(() => {
-      void syncR2WithLocal(DATA_FILE);
+      void syncR2WithLocal(DATA_FILE).catch((error) => {
+        console.warn(`[R2 DB] Periodic sync failed: ${error.message}`);
+      });
     }, R2_SYNC_INTERVAL_MS);
   }
 
@@ -99,8 +107,12 @@ async function initAdapter() {
 
 function withR2Sync(adapter) {
   function sync() {
-    try { adapter.checkpoint?.(); } catch {}
-    void uploadDbToR2(DATA_FILE);
+    try {
+      adapter.checkpoint?.();
+    } catch (error) {
+      console.warn(`[DB] SQLite checkpoint failed: ${error.message}`);
+    }
+    queueUploadDbToR2();
   }
 
   return {
