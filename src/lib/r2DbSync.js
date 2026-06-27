@@ -8,16 +8,22 @@ initConsoleLogCapture();
 
 const DEFAULT_DB_KEY = "db.json";
 const ENCRYPTED_DB_PREFIX = "9router-db-v1";
+const R2_RETRY_COOLDOWN_MS = 30000;
 const SYNC_STATE = {
   lastRemoteETag: null,
   isPulling: false,
   pendingUpload: false,
+  nextUploadRetryAt: 0,
 };
 
 let client = null;
 const initPromises = new Map();
 let syncQueue = Promise.resolve();
 let lastQueueError = null;
+
+function getErrorMessage(error) {
+  return error?.message || error?.Code || error?.name || String(error);
+}
 
 function hasExplicitKey() {
   return Boolean(process.env.R2_DB_KEY || process.env.R2_OBJECT_KEY);
@@ -179,7 +185,7 @@ async function downloadDbFromR2(localPath) {
       console.warn(`[R2 DB] Object ${bucket}/${key} not found; using local db`);
       return;
     }
-    console.warn(`[R2 DB] Download failed for ${bucket}/${key}: ${error.message}`);
+    console.warn(`[R2 DB] Download failed for ${bucket}/${key}: ${getErrorMessage(error)}`);
   }
 }
 
@@ -188,7 +194,7 @@ export async function uploadDbToR2(localPath) {
 
   syncQueue = syncQueue
     .catch((error) => {
-      const message = error?.message || String(error);
+      const message = getErrorMessage(error);
       if (message !== lastQueueError) {
         console.warn(`[R2 DB] Previous sync task failed: ${message}`);
         lastQueueError = message;
@@ -200,6 +206,7 @@ export async function uploadDbToR2(localPath) {
         console.warn("[R2 DB] Upload deferred: pull in progress. Will upload after pull.");
         return;
       }
+      if (SYNC_STATE.pendingUpload && Date.now() < SYNC_STATE.nextUploadRetryAt) return;
       return uploadDbFile(localPath);
     });
 
@@ -243,11 +250,13 @@ async function uploadDbFile(localPath) {
 
     SYNC_STATE.lastRemoteETag = response.ETag;
     SYNC_STATE.pendingUpload = false;
+    SYNC_STATE.nextUploadRetryAt = 0;
     lastQueueError = null;
     console.log(`[R2 DB] Uploaded portable backup to ${bucket}/${key}`);
   } catch (error) {
     SYNC_STATE.pendingUpload = true;
-    console.warn(`[R2 DB] Upload failed for ${bucket}/${key}: ${error.message}`);
+    SYNC_STATE.nextUploadRetryAt = Date.now() + R2_RETRY_COOLDOWN_MS;
+    console.warn(`[R2 DB] Upload failed for ${bucket}/${key}: ${getErrorMessage(error)}`);
     throw error;
   }
 }
@@ -260,7 +269,7 @@ export async function syncR2WithLocal(localPath) {
 
   syncQueue = syncQueue
     .catch((error) => {
-      const message = error?.message || String(error);
+      const message = getErrorMessage(error);
       if (message !== lastQueueError) {
         console.warn(`[R2 DB] Previous sync task failed: ${message}`);
         lastQueueError = message;
@@ -344,7 +353,7 @@ export async function syncR2WithLocal(localPath) {
         }
       } catch (error) {
         if (!isMissingObjectError(error)) {
-          console.warn(`[R2 DB] Real-time sync pull failed: ${error.message}`);
+          console.warn(`[R2 DB] Real-time sync pull failed: ${getErrorMessage(error)}`);
         }
         throw error;
       } finally {
