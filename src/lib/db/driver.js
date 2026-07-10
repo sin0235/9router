@@ -1,5 +1,5 @@
 import { ensureDirs, DATA_FILE, LEGACY_FILES } from "./paths.js";
-import { initR2Db, uploadDbToR2, syncR2WithLocal } from "@/lib/r2DbSync.js";
+import { initR2Db, isR2DbEnabled, uploadDbToR2, syncR2WithLocal } from "@/lib/r2DbSync.js";
 import { initConsoleLogCapture } from "@/lib/consoleLogBuffer.js";
 
 initConsoleLogCapture();
@@ -66,8 +66,11 @@ async function trySqlJs() {
 
 async function initAdapter() {
   ensureDirs();
-  await initR2Db(DATA_FILE);
-  await initR2Db(LEGACY_FILES.main);
+  const r2Enabled = isR2DbEnabled(DATA_FILE);
+  if (r2Enabled) {
+    await initR2Db(DATA_FILE);
+    await initR2Db(LEGACY_FILES.main);
+  }
 
   // Order per runtime:
   //   Bun:  bun:sqlite → sql.js
@@ -87,9 +90,11 @@ async function initAdapter() {
   await runMigrationOnce(adapter);
   adapter.checkpoint?.();
 
+  if (!r2Enabled) return adapter;
+
   const syncedAdapter = withR2Sync(adapter);
   state.instance = syncedAdapter;
-  
+
   // 1. Initial Pull: Ensure we have the latest from cloud before we push any local changes (like migrations)
   await syncR2WithLocal(DATA_FILE);
 

@@ -1,5 +1,6 @@
 import { detectFormat, getTargetFormat, resolveTransport } from "../services/provider.js";
 import { translateRequest } from "../translator/index.js";
+import { stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
 import { FORMATS } from "../translator/formats.js";
 import { normalizeClaudePassthrough } from "../translator/formats/claude.js";
 import { COLORS } from "../utils/stream.js";
@@ -123,9 +124,9 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   let toolNameMap;
   if (passthrough) {
     log?.debug?.("PASSTHROUGH", `${clientTool} → ${provider} | native lossless`);
-    translatedBody = { ...body, model: upstreamModel };
+    translatedBody = { ...body, model: stripThinkingSuffix(upstreamModel) };
     // Normalize newer Cowork/CC beta shapes (adaptive thinking, mid-conversation system) the API rejects
-    if (clientTool === "claude") normalizeClaudePassthrough(translatedBody, upstreamModel);
+    if (clientTool === "claude") normalizeClaudePassthrough(translatedBody, translatedBody.model);
   } else {
     translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool);
     if (!translatedBody) {
@@ -134,7 +135,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     }
     toolNameMap = translatedBody._toolNameMap;
     delete translatedBody._toolNameMap;
-    translatedBody.model = upstreamModel;
+    translatedBody.model = stripThinkingSuffix(upstreamModel);
   }
 
   // Dedupe duplicate built-in tools when equivalent MCP tools are present (Claude clients only).
@@ -236,7 +237,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   if (stream && clientRequestedStreaming) {
     const sharedCtx = { provider, model, body, stream, translatedBody, finalBody: null, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess };
-    const { onStreamComplete } = buildOnStreamComplete({ ...sharedCtx });
+    const { onStreamComplete, streamDetailId } = buildOnStreamComplete({ ...sharedCtx });
     return handleDeferredStreamingResponse({
       ...sharedCtx,
       sourceFormat,
@@ -246,6 +247,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       toolNameMap,
       streamController,
       onStreamComplete,
+      streamDetailId,
       executeProvider: async () => {
         const result = await executor.execute({ model, body: translatedBody, stream, credentials, signal: streamController.signal, log, proxyOptions });
         reqLogger.logTargetRequest(result.url, result.headers, result.transformedBody);
@@ -346,8 +348,8 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   }
 
   // Streaming response
-  const { onStreamComplete } = buildOnStreamComplete({ ...sharedCtx });
-  return handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, streamController, onStreamComplete });
+  const { onStreamComplete, streamDetailId } = buildOnStreamComplete({ ...sharedCtx });
+  return handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, streamController, onStreamComplete, streamDetailId });
 }
 
 export function isTokenExpiringSoon(expiresAt, bufferMs = 5 * 60 * 1000) {

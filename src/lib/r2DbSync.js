@@ -44,7 +44,12 @@ function getConfig(localPath) {
   return { accountId, accessKeyId, secretAccessKey, bucket, key, endpoint };
 }
 
+function isR2SyncModeEnabled() {
+  return process.env.R2_DB_SYNC_ENABLED === "true";
+}
+
 export function isR2DbEnabled(localPath) {
+  if (!isR2SyncModeEnabled()) return false;
   const { accountId, accessKeyId, secretAccessKey, bucket, key, endpoint } = getConfig(localPath);
   return Boolean(accountId && accessKeyId && secretAccessKey && bucket && key && endpoint);
 }

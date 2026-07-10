@@ -46,7 +46,7 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
 /**
  * Handle streaming response — pipe provider SSE through transform stream to client.
  */
-export function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, streamController, onStreamComplete }) {
+export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, streamController, onStreamComplete, streamDetailId }) {
   if (onRequestSuccess) {
     Promise.resolve()
       .then(onRequestSuccess)
@@ -55,12 +55,30 @@ export function handleStreamingResponse({ providerResponse, provider, model, sou
       });
   }
 
-  // Warn when upstream returns unexpected Content-Type for a streaming response.
-  // This often means the provider returned an HTML error page or plain-text error
-  // that the SSE transform stream would forward as garbage to the client.
+  // When upstream returns HTML/text instead of SSE (e.g. Cloudflare 5xx error
+  // page), piping it through the SSE transform stream causes Next.js
+  // "failed to pipe response" and crashes the chat router. Read the body,
+  // pull a short human-readable message from the <title>, sanitize it, and
+  // return a clean JSON error instead. The message is stripped of HTML tags
+  // and clamped so untrusted upstream text never reaches the client verbatim
+  // (the UI may render error.message as HTML).
   const upstreamContentType = (providerResponse.headers.get('content-type') || '').toLowerCase();
   if (upstreamContentType && !upstreamContentType.includes('text/event-stream') && !upstreamContentType.includes('application/json')) {
-    console.warn('[STREAM] ' + provider + ' | ' + model + ' | unexpected Content-Type: ' + upstreamContentType);
+    const bodyText = await providerResponse.text().catch(() => '');
+    const titleMatch = bodyText.match(/<title>([^<]+)<\/title>/i);
+    const sanitizedTitle = (titleMatch?.[1] || '').replace(/<[^>]*>/g, '').replace(/[\r\n]+/g, ' ').trim().slice(0, 160);
+    const shortMsg = sanitizedTitle
+      || (bodyText.length < 200 ? bodyText.replace(/<[^>]*>/g, '').trim().slice(0, 160) : `Upstream returned non-SSE response (${upstreamContentType})`);
+    const status = providerResponse.status || 502;
+    console.warn(`[STREAM] ${provider} | ${model} | blocked pipe: ${shortMsg} [${status}]`);
+    streamController?.handleError?.(new Error(`upstream non-SSE: ${status}`));
+    return {
+      success: false,
+      response: new Response(JSON.stringify({ error: { message: `[${status}]: ${shortMsg}` } }), {
+        status,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      }),
+    };
   }
 
   const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey });
@@ -71,7 +89,7 @@ export function handleStreamingResponse({ providerResponse, provider, model, sou
   const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
   const transformedBody = withHeartbeat(pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs), streamController);
 
-  persistStreamingStart({ provider, model, connectionId, body, stream, translatedBody, finalBody, requestStartTime });
+  persistStreamingStart({ provider, model, connectionId, body, stream, translatedBody, finalBody, requestStartTime, streamDetailId });
 
   return {
     success: true,
@@ -79,7 +97,7 @@ export function handleStreamingResponse({ providerResponse, provider, model, sou
   };
 }
 
-export function handleDeferredStreamingResponse({ executeProvider, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, streamController, onStreamComplete }) {
+export function handleDeferredStreamingResponse({ executeProvider, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, streamController, onStreamComplete, streamDetailId }) {
   const responseBody = new ReadableStream({
     async start(controller) {
       let heartbeat = null;
@@ -120,7 +138,7 @@ export function handleDeferredStreamingResponse({ executeProvider, provider, mod
     }
   });
 
-  persistStreamingStart({ provider, model, connectionId, body, stream, translatedBody, finalBody, requestStartTime });
+  persistStreamingStart({ provider, model, connectionId, body, stream, translatedBody, finalBody, requestStartTime, streamDetailId });
 
   return {
     success: true,
@@ -158,8 +176,7 @@ function withHeartbeat(readable, streamController) {
   });
 }
 
-function persistStreamingStart({ provider, model, connectionId, body, stream, translatedBody, finalBody, requestStartTime }) {
-  const streamDetailId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+function persistStreamingStart({ provider, model, connectionId, body, stream, translatedBody, finalBody, requestStartTime, streamDetailId }) {
   saveRequestDetail(buildRequestDetail({
     provider, model, connectionId,
     latency: { ttft: 0, total: Date.now() - requestStartTime },

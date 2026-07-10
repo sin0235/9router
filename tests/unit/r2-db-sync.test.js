@@ -42,6 +42,7 @@ const originalEnv = { ...process.env };
 const localPath = "/tmp/9router-test.sqlite";
 
 function setR2Env(extra = {}) {
+  process.env.R2_DB_SYNC_ENABLED = "true";
   process.env.R2_ACCOUNT_ID = "account";
   process.env.R2_ACCESS_KEY_ID = "access";
   process.env.R2_SECRET_ACCESS_KEY = "secret";

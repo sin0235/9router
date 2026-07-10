@@ -4,6 +4,20 @@ import os from "node:os";
 import path from "node:path";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
+const r2Mock = vi.hoisted(() => ({
+  isEnabled: vi.fn(() => false),
+  init: vi.fn(),
+  upload: vi.fn(),
+  sync: vi.fn(),
+}));
+
+vi.mock("@/lib/r2DbSync.js", () => ({
+  isR2DbEnabled: r2Mock.isEnabled,
+  initR2Db: r2Mock.init,
+  uploadDbToR2: r2Mock.upload,
+  syncR2WithLocal: r2Mock.sync,
+}));
+
 let tempDir;
 const originalDataDir = process.env.DATA_DIR;
 
@@ -11,6 +25,10 @@ beforeEach(() => {
   tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "9router-chain-"));
   process.env.DATA_DIR = tempDir;
   delete global._dbAdapter;
+  r2Mock.isEnabled.mockReturnValue(false);
+  r2Mock.init.mockReset();
+  r2Mock.upload.mockReset();
+  r2Mock.sync.mockReset();
   vi.resetModules();
 });
 
@@ -23,6 +41,17 @@ afterEach(() => {
 });
 
 describe("Driver fallback chain", () => {
+  it("giữ hành vi DB gốc khi R2 sync tắt", async () => {
+    const { getAdapter } = await import("@/lib/db/driver.js");
+    const db = await getAdapter();
+
+    db.run("SELECT 1");
+
+    expect(r2Mock.init).not.toHaveBeenCalled();
+    expect(r2Mock.sync).not.toHaveBeenCalled();
+    expect(r2Mock.upload).not.toHaveBeenCalled();
+  });
+
   it("default → picks better-sqlite3 when available", async () => {
     const { getAdapter } = await import("@/lib/db/driver.js");
     const db = await getAdapter();
