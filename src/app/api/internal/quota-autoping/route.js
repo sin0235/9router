@@ -18,7 +18,9 @@ export async function POST(request) {
   }
 
   const authorization = request.headers.get("authorization") || "";
-  const receivedSecret = /^Bearer\s+(.+)$/i.exec(authorization)?.[1] || "";
+  const receivedSecret = /^Bearer\s+(.+)$/i.exec(authorization)?.[1]
+    || request.headers.get("x-quota-autoping-secret")
+    || "";
   if (!matchesSecret(expectedSecret, receivedSecret)) {
     return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
   }

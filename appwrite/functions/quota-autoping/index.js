@@ -23,6 +23,7 @@ export async function handleQuotaAutoPing({ res, log = () => {}, error = () => {
       method: "POST",
       headers: {
         authorization: `Bearer ${config.secret}`,
+        "x-quota-autoping-secret": config.secret,
         accept: "application/json",
       },
       signal: AbortSignal.timeout(55000),
