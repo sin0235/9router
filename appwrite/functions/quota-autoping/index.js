@@ -1,6 +1,6 @@
 function getConfig() {
   const targetUrl = process.env.QUOTA_AUTOPING_TARGET_URL?.trim().replace(/\/+$/, "");
-  const secret = process.env.QUOTA_AUTOPING_SECRET?.trim();
+  const secret = (process.env.QUOTA_AUTOPING_SECRET_V2 || process.env.QUOTA_AUTOPING_SECRET)?.trim();
   if (!targetUrl || !secret) throw new Error("Function variables are not configured");
 
   const parsedUrl = new URL(targetUrl);

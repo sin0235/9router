@@ -12,11 +12,13 @@ import { handleQuotaAutoPing } from "../../appwrite/functions/quota-autoping/ind
 describe("Appwrite-safe quota auto-ping header", () => {
   const originalTarget = process.env.QUOTA_AUTOPING_TARGET_URL;
   const originalSecret = process.env.QUOTA_AUTOPING_SECRET;
+  const originalSecretV2 = process.env.QUOTA_AUTOPING_SECRET_V2;
 
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.QUOTA_AUTOPING_TARGET_URL = "https://api-9router.sin-studio.tech";
     process.env.QUOTA_AUTOPING_SECRET = "test-secret";
+    delete process.env.QUOTA_AUTOPING_SECRET_V2;
   });
 
   afterEach(() => {
@@ -24,6 +26,8 @@ describe("Appwrite-safe quota auto-ping header", () => {
     else process.env.QUOTA_AUTOPING_TARGET_URL = originalTarget;
     if (originalSecret === undefined) delete process.env.QUOTA_AUTOPING_SECRET;
     else process.env.QUOTA_AUTOPING_SECRET = originalSecret;
+    if (originalSecretV2 === undefined) delete process.env.QUOTA_AUTOPING_SECRET_V2;
+    else process.env.QUOTA_AUTOPING_SECRET_V2 = originalSecretV2;
   });
 
   it("allows the Site route to authenticate with the Appwrite-safe header", async () => {
@@ -48,5 +52,17 @@ describe("Appwrite-safe quota auto-ping header", () => {
         headers: expect.objectContaining({ "x-quota-autoping-secret": "test-secret" }),
       }),
     );
+  });
+
+  it("prefers the rotated V2 secret when configured", async () => {
+    delete process.env.QUOTA_AUTOPING_SECRET;
+    process.env.QUOTA_AUTOPING_SECRET_V2 = "test-secret-v2";
+
+    const response = await POST(new Request("http://localhost/api/internal/quota-autoping", {
+      method: "POST",
+      headers: { "x-quota-autoping-secret": "test-secret-v2" },
+    }));
+
+    expect(response.status).toBe(200);
   });
 });

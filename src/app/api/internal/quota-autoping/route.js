@@ -12,7 +12,7 @@ function matchesSecret(expected, received) {
 }
 
 export async function POST(request) {
-  const expectedSecret = process.env.QUOTA_AUTOPING_SECRET?.trim();
+  const expectedSecret = (process.env.QUOTA_AUTOPING_SECRET_V2 || process.env.QUOTA_AUTOPING_SECRET)?.trim();
   if (!expectedSecret) {
     return NextResponse.json({ ok: false, error: "Auto-ping secret is not configured" }, { status: 503 });
   }
