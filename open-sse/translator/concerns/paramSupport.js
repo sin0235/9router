@@ -6,14 +6,17 @@ import { getCapabilitiesForModel } from "../../providers/capabilities.js";
 // Each rule: optional provider, regex match on model, list of params to drop.
 // A param is removed only when it is present (!== undefined).
 const STRIP_RULES = [
-  // claude-opus-4 series: temperature is deprecated (Anthropic 400). #1748
-  { match: /claude-opus-4/i, drop: ["temperature"] },
+  // All Claude models: temperature deprecated/rejected upstream (Anthropic 400). #1748
+  { match: /claude/i, drop: ["temperature"] },
   // GitHub Copilot gpt-5.4: temperature unsupported.
   { provider: "github", match: /gpt-5\.4/i, drop: ["temperature"] },
   // GitHub Copilot Claude (except opus/sonnet 4.6): thinking + reasoning_effort rejected. #713
   { provider: "github", match: (m) => /claude/i.test(m) && !/claude.*(opus|sonnet).*4\.6/i.test(m), drop: ["thinking", "reasoning_effort"] },
   // Cloudflare Workers AI: content must be plain string, rejects OpenAI content-part array (#1926)
   { provider: "cloudflare-ai", flattenContent: true },
+  // MiMo Desktop Preview models (account-service route): content must be plain string,
+  // rejects OpenAI content-part array. Cloud models keep their parts (mimo-v2-omni is multi-modal).
+  { provider: "xiaomi-mimo", match: /preview/i, flattenContent: true },
   { provider: "volcengine-ark", match: /glm-5/i, clampToModelMaxOutput: true },
   // VolcEngine Ark caps the Kimi family at max_tokens <= 32768, but the model's
   // advertised ceiling is far higher (Kimi-K2.7-Code resolves to maxOutput 262144),

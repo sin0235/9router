@@ -31,14 +31,21 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { SSE_DONE } from "../utils/sseConstants.js";
 import { FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import {
-  QODER_CHAT_URL_ENCODED,
-  QODER_MODEL_MAP,
+  QODER_CHAT_SIG_PATH,
+  QODER_CONTEXT_TIER_ENV,
+  qoderInferenceBase,
 } from "../shared/qoder/constants.js";
-import { getQoderModelConfig, resolveQoderModels } from "../services/qoderModels.js";
+import { getQoderModelConfig, resolveQoderModels, isQoderPat, resolveQoderCredentials } from "../services/qoderModels.js";
+import { OPENAI_BLOCK, CLAUDE_BLOCK } from "../translator/schema/blocks.js";
+import { encodeDataUri } from "../translator/concerns/image.js";
+import { createQoderSseCoalescer } from "../shared/qoder/sse.js";
+import { rewriteQoderMessageAttachments } from "../shared/qoder/attachments.js";
+import { resolveQoderContextTier, applyQoderContextTier } from "../shared/qoder/contextTier.js";
 
 /**
  * Hoist role:"system" messages out of the messages array (Qoder rejects
- * system in messages) and flatten any multipart content arrays.
+ * system in messages) and flatten multipart content arrays — EXCEPT image
+ * blocks, which are preserved (see normalizeContent).
  */
 function normalizeMessages(messages) {
   if (!Array.isArray(messages) || messages.length === 0) {
@@ -48,16 +55,86 @@ function normalizeMessages(messages) {
   const out = [];
   for (const msg of messages) {
     if (!msg || typeof msg !== "object") continue;
-    const text = extractText(msg.content);
     if (msg.role === "system") {
+      const text = extractText(msg.content);
       if (text) systemParts.push(text);
       continue;
     }
     const cloned = { ...msg };
-    cloned.content = text;
+    cloned.content = normalizeContent(msg.content);
     out.push(cloned);
   }
   return { messages: out, systemText: systemParts.join("\n\n") };
+}
+
+/**
+ * Normalize one message's content for Qoder.
+ *
+ * Text-only content is flattened to a plain string (Qoder's historical
+ * shape). When images are present the content stays an array and image
+ * blocks are kept as OpenAI-style `image_url` parts. Native qodercli
+ * uploads inlined bytes to `/api/v2/image/upload` first and then sends
+ * the OSS URL — `buildQoderRequestBody` does that rewrite before this
+ * runs. Tiny leftover data URIs are still accepted. The legacy
+ * top-level `image_urls` / `chat_context.imageUrls` slots stay null —
+ * qodercli leaves them null too.
+ *
+ * Claude-style `{type:"image", source:{...}}` blocks are converted to
+ * `image_url`. File/document blocks that survived rewrite become short
+ * stubs so 30MB PDFs never land in agent_chat_generation.
+ */
+function normalizeContent(content) {
+  if (typeof content === "string") return content;
+  if (content == null) return "";
+  if (!Array.isArray(content)) return String(content);
+
+  const blocks = [];
+  const textParts = [];
+  let hasImage = false;
+
+  const pushText = (text) => {
+    if (!text) return;
+    if (hasImage || blocks.length) blocks.push({ type: OPENAI_BLOCK.TEXT, text });
+    else textParts.push(text);
+  };
+
+  const imageUrlOf = (item) => {
+    if (typeof item.image_url === "string" && item.image_url) return item.image_url;
+    if (typeof item.image_url?.url === "string" && item.image_url.url) return item.image_url.url;
+    return null;
+  };
+
+  for (const item of content) {
+    if (!item || typeof item !== "object") continue;
+    const imageUrl = item.type === OPENAI_BLOCK.IMAGE_URL ? imageUrlOf(item) : null;
+    if (imageUrl) {
+      blocks.push({ type: OPENAI_BLOCK.IMAGE_URL, image_url: { url: imageUrl } });
+      hasImage = true;
+    } else if (item.type === CLAUDE_BLOCK.IMAGE && item.source) {
+      // Claude base64/url image → OpenAI image_url equivalent.
+      const src = item.source;
+      const url = src.type === "base64" && src.data
+        ? encodeDataUri(src.media_type || "image/png", src.data)
+        : typeof src.url === "string" && src.url ? src.url : null;
+      if (url) {
+        blocks.push({ type: OPENAI_BLOCK.IMAGE_URL, image_url: { url } });
+        hasImage = true;
+      }
+    } else if (item.type === OPENAI_BLOCK.FILE) {
+      const name = item.file?.filename || item.file?.name || "file";
+      pushText(`[file omitted: ${name} — Qoder reads documents via its file API, not inlined bytes]`);
+    } else if (item.type === CLAUDE_BLOCK.DOCUMENT) {
+      const name = item.title || "document";
+      pushText(`[file omitted: ${name} — Qoder reads documents via its file API, not inlined bytes]`);
+    } else if (typeof item.text === "string" && item.text) {
+      pushText(item.text);
+    }
+  }
+
+  if (!hasImage) return textParts.join("\n");
+  // Prepend any text collected before the first image block.
+  if (textParts.length) blocks.unshift({ type: OPENAI_BLOCK.TEXT, text: textParts.join("\n") });
+  return blocks;
 }
 
 function extractText(content) {
@@ -82,9 +159,9 @@ function extractText(content) {
 function lastUserText(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
-    if (m?.role === "user" && typeof m.content === "string") {
-      return m.content;
-    }
+    if (m?.role !== "user") continue;
+    if (typeof m.content === "string") return m.content;
+    if (Array.isArray(m.content)) return extractText(m.content);
   }
   return "";
 }
@@ -108,6 +185,11 @@ function stableChatRecordId(model, messages, tools, maxTokens) {
     if (m.role) { h.update("\0"); h.update(m.role); }
     if (typeof m.content === "string" && m.content) {
       h.update("\0"); h.update(m.content);
+    } else if (Array.isArray(m.content)) {
+      // Include image refs so the same prompt with a different image gets
+      // a distinct chat_record_id.
+      h.update("\0");
+      try { h.update(JSON.stringify(m.content)); } catch {}
     }
   }
   if (tools) {
@@ -125,7 +207,7 @@ function truncate(s, n) {
 /**
  * Map the OpenAI-style request body into the exact shape Qoder expects.
  */
-async function buildQoderRequestBody({ model, body, credentials, log, proxyOptions, signal }) {
+async function buildQoderRequestBody({ model, body, credentials, log, proxyOptions, signal, uploadFn = null }) {
   const qoderKey = String(model || "").replace(/^qoder\//, "");
   
   // Fetch model config from dynamic API instead of relying on static QODER_MODEL_MAP.
@@ -144,7 +226,30 @@ async function buildQoderRequestBody({ model, body, credentials, log, proxyOptio
     modelConfig = { ...retried, key: qoderKey };
   }
 
-  const { messages, systemText } = normalizeMessages(body.messages || []);
+  const incoming = Array.isArray(body.messages)
+    ? body.messages.map((m) => {
+      if (!m || typeof m !== "object") return m;
+      return {
+        ...m,
+        content: Array.isArray(m.content)
+          ? m.content.map((b) => (b && typeof b === "object" ? { ...b } : b))
+          : m.content,
+      };
+    })
+    : [];
+  try {
+    await rewriteQoderMessageAttachments(incoming, {
+      credentials,
+      log,
+      proxyOptions,
+      signal,
+      uploadFn,
+    });
+  } catch (err) {
+    log?.warn?.("QODER", `attachment rewrite failed: ${err.message}`);
+  }
+
+  const { messages, systemText } = normalizeMessages(incoming);
   const tools = body.tools;
   const isReasoning = !!modelConfig.is_reasoning;
   const maxOutputTokens = Number(modelConfig.max_output_tokens) || 0;
@@ -163,7 +268,21 @@ async function buildQoderRequestBody({ model, body, credentials, log, proxyOptio
   const sessionId = stableHash("qoder-session", psd.userId, qoderKey);
   const recordId = stableChatRecordId(qoderKey, messages, tools, maxTokens);
 
-  return {
+  // Context-window tier (200K/400K/1M): the IDE picks one from model_config.context_config;
+  // qodercli-style requests default to the smallest. Escalate when the prompt no longer fits.
+  const tierChoice = resolveQoderContextTier(
+    modelConfig,
+    { system: systemText, messages, tools },
+    { preference: process.env[QODER_CONTEXT_TIER_ENV] },
+  );
+  if (tierChoice) {
+    log?.info?.(
+      "QODER",
+      `context tier ${tierChoice.tier.name} (${tierChoice.tier.tokenCount} tokens, ${tierChoice.reason}) for ~${tierChoice.estimatedTokens} prompt tokens`,
+    );
+  }
+
+  const built = {
     qoderKey,
     payload: {
       request_id: uuidv4(),
@@ -211,6 +330,54 @@ async function buildQoderRequestBody({ model, body, credentials, log, proxyOptio
     },
     modelConfig,
   };
+  if (tierChoice) applyQoderContextTier(built.payload, tierChoice.tier);
+  return built;
+}
+
+/**
+ * Check if a qoder error message indicates a billing/quota block.
+ * Signatures: code 112 (quota exhausted), code 10605 (queue throttle), pricingUrl field.
+ */
+function isBillingBlock(inner) {
+  if (!inner || typeof inner !== "string") return false;
+  const lowerMsg = inner.toLowerCase();
+  // Match: {"code":"112",...}, {"code":"10605",...}, or pricingUrl field
+  return /\"code\"\s*:\s*\"(112|10605)\"/.test(inner) || lowerMsg.includes("pricingurl");
+}
+
+/**
+ * Peek the first SSE frame to detect billing errors before piping.
+ * Returns { isBilling, statusVal, message, consumed } — `consumed` is every
+ * byte read so far (including the peeked line) so the caller can re-process
+ * it and nothing is dropped from the stream.
+ */
+async function peekFirstQoderFrame(reader, decoder) {
+  let consumed = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) return { isBilling: false, consumed, upstreamDone: true };
+
+    consumed += decoder.decode(value, { stream: true });
+    const nl = consumed.indexOf("\n");
+    if (nl === -1) continue; // need a full line first
+
+    const line = consumed.slice(0, nl).replace(/\r$/, "").trim();
+    if (!line.startsWith("data:")) continue;
+
+    const data = line.slice(5).trimStart();
+    if (data === "[DONE]") return { isBilling: false, consumed };
+
+    let envelope;
+    try { envelope = JSON.parse(data); } catch { return { isBilling: false, consumed }; }
+
+    const statusVal = typeof envelope.statusCodeValue === "number" ? envelope.statusCodeValue : 200;
+    const inner = typeof envelope.body === "string" ? envelope.body : "";
+
+    if (statusVal !== 200 && isBillingBlock(inner)) {
+      return { isBilling: true, statusVal, message: inner || `qoder billing block (${statusVal})` };
+    }
+    return { isBilling: false, consumed };
+  }
 }
 
 /**
@@ -220,37 +387,71 @@ async function buildQoderRequestBody({ model, body, credentials, log, proxyOptio
  * Each upstream line looks like:
  *   data: {"statusCodeValue":200,"body":"{\"choices\":[{\"delta\":{...}}]}"}
  * The inner body is an OpenAI streaming chunk (or "[DONE]"). We unwrap it
- * and re-emit as `data: <inner>\n\n`. Errors become `data: [DONE]\n\n` plus
- * a synthetic OpenAI error chunk.
+ * and re-emit as `data: <inner>\n\n`. Errors become a synthetic OpenAI error
+ * chunk + [DONE].
+ *
+ * Critical: Qoder's SSE often keeps the socket open after the terminal
+ * [DONE]/error frame (agent keepalive). Non-streaming clients drain via
+ * response.text() which hangs until the socket closes — so on terminal
+ * events we cancel the upstream reader and close our stream immediately.
+ *
+ * Usage: Qoder puts finish_reason on `delta` and sends token counts on a
+ * later `choices: []` frame. Downstream OpenAI/Claude clients only read
+ * usage from the finish chunk, so we coalesce those two frames (see
+ * createQoderSseCoalescer) before forwarding.
+ *
+ * NEW: Peek first frame to detect billing blocks (code 112/10605/pricingUrl).
+ * If detected, return 403 response so chatCore marks connection unavailable
+ * and triggers combo fallback instead of leaking error text into chat.
  */
-function wrapQoderSSE(response, model) {
+async function wrapQoderSSE(response, model) {
   if (!response.ok || !response.body) return response;
 
   const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-  let buffer = "";
-  let doneEmitted = false;
+  const reader = response.body.getReader();
 
-  // Process one already-extracted SSE line (no trailing newline). Returns
-  // false when the line indicated end-of-stream so the caller can stop
-  // forwarding any remaining chunks after [DONE].
+  // Peek first frame to detect billing block
+  const peek = await peekFirstQoderFrame(reader, decoder);
+  if (peek?.isBilling) {
+    // Billing block detected — return 403 so chatCore fails this connection
+    await reader.cancel().catch(() => {});
+    return new Response(
+      JSON.stringify({ error: { message: peek.message, code: peek.statusVal } }),
+      { status: 403, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  // Normal flow: re-process every byte the peek consumed, then continue.
+  let buffer = peek.consumed || "";
+  const upstreamDrained = peek.upstreamDone === true;
+  const encoder = new TextEncoder();
+  let doneEmitted = false;
+  const coalescer = createQoderSseCoalescer({ model, encoder, sseDone: SSE_DONE });
+
+  const syncDone = () => {
+    if (coalescer.doneEmitted) doneEmitted = true;
+  };
+
+  // Process one already-extracted SSE line (no trailing newline).
   const processLine = (line, controller) => {
     const trimmed = line.replace(/\r$/, "").trim();
     if (!trimmed) return;
     if (!trimmed.startsWith("data:")) return;
-    if (doneEmitted) return; // never forward chunks past stream end
+    if (doneEmitted) return;
 
     const data = trimmed.slice(5).trimStart();
     if (data === "[DONE]") {
-      controller.enqueue(encoder.encode(SSE_DONE));
-      doneEmitted = true;
+      coalescer.flush(controller);
+      syncDone();
       return;
     }
 
     let envelope;
     try { envelope = JSON.parse(data); } catch { return; }
     const statusVal = typeof envelope.statusCodeValue === "number" ? envelope.statusCodeValue : 200;
-    const inner = typeof envelope.body === "string" ? envelope.body : "";
+    const inner = typeof envelope.body === "string"
+      ? envelope.body
+      : envelope.body != null ? JSON.stringify(envelope.body) : "";
     if (statusVal !== 200) {
       const msg = inner || `upstream status ${statusVal}`;
       const errChunk = JSON.stringify({
@@ -266,52 +467,80 @@ function wrapQoderSSE(response, model) {
       return;
     }
     if (!inner) return;
-    if (inner === "[DONE]") {
-      controller.enqueue(encoder.encode(SSE_DONE));
-      doneEmitted = true;
-      return;
-    }
-    // Inner is an OpenAI-shaped chunk. Strip any embedded newlines so the
-    // SSE frame stays a single event (a literal "\n" inside `inner` would
-    // otherwise split the frame across multiple data: lines and downstream
-    // parsers would reassemble them as separate events).
-    const sanitized = inner.replace(/\r?\n/g, "");
-    controller.enqueue(encoder.encode(`data: ${sanitized}\n\n`));
+    coalescer.handleInner(inner, controller);
+    syncDone();
   };
 
-  const transform = new TransformStream({
-    transform(chunk, controller) {
-      buffer += decoder.decode(chunk, { stream: true });
-      let nl;
-      while ((nl = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, nl);
-        buffer = buffer.slice(nl + 1);
-        processLine(line, controller);
+  const stream = new ReadableStream({
+    // Use start()+loop (not pull): a pull that buffers a partial line without
+    // enqueueing would never be re-invoked, hanging consumers like .text().
+    async start(controller) {
+      try {
+        // Drain whatever the peek already pulled off the socket first.
+        let nlSeed;
+        while ((nlSeed = buffer.indexOf("\n")) !== -1) {
+          const line = buffer.slice(0, nlSeed);
+          buffer = buffer.slice(nlSeed + 1);
+          processLine(line, controller);
+          if (doneEmitted) {
+            await reader.cancel().catch(() => {});
+            controller.close();
+            return;
+          }
+        }
+        if (upstreamDrained) {
+          // Peek hit end-of-stream: flush any trailing partial line.
+          buffer += decoder.decode();
+          if (buffer.length > 0) {
+            processLine(buffer, controller);
+            buffer = "";
+          }
+        }
+
+        while (!doneEmitted && !upstreamDrained) {
+          const { done, value } = await reader.read();
+          if (done) {
+            buffer += decoder.decode();
+            if (buffer.length > 0) {
+              processLine(buffer, controller);
+              buffer = "";
+            }
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+          let nl;
+          while ((nl = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, nl);
+            buffer = buffer.slice(nl + 1);
+            processLine(line, controller);
+            if (doneEmitted) {
+              // Terminal frame received — drop upstream keepalive and end.
+              await reader.cancel().catch(() => {});
+              controller.close();
+              return;
+            }
+          }
+        }
+      } catch {
+        // fall through to terminal [DONE] + close
+      } finally {
+        if (!doneEmitted) {
+          try {
+            coalescer.flush(controller);
+            doneEmitted = true;
+          } catch { /* already closed */ }
+        }
+        try { controller.close(); } catch { /* already closed */ }
+        await reader.cancel().catch(() => {});
       }
     },
-    flush(controller) {
-      // Finalize the decoder so any pending multi-byte sequence is
-      // released into `buffer` instead of being silently dropped.
-      buffer += decoder.decode();
-      // Drain any trailing line that arrived without a terminating newline
-      // (e.g. upstream closed the socket immediately after the last write,
-      // or a CDN stripped the final CRLF). Without this, the chunk that
-      // carries finish_reason is silently lost.
-      if (buffer.length > 0) {
-        processLine(buffer, controller);
-        buffer = "";
-      }
-      if (!doneEmitted) {
-        controller.enqueue(encoder.encode(SSE_DONE));
-        doneEmitted = true;
-      }
+    cancel() {
+      return reader.cancel().catch(() => {});
     },
   });
 
-  const transformed = response.body.pipeThrough(transform);
-  // Build a Response with passable headers; the streaming handler reads
-  // `.body` as a ReadableStream regardless of Content-Type.
-  return new Response(transformed, {
+  return new Response(stream, {
     status: response.status,
     statusText: response.statusText,
     headers: {
@@ -326,8 +555,8 @@ export class QoderExecutor extends BaseExecutor {
     super("qoder", PROVIDERS.qoder);
   }
 
-  buildUrl() {
-    return QODER_CHAT_URL_ENCODED;
+  buildUrl(credentials) {
+    return `${qoderInferenceBase(credentials)}/algo${QODER_CHAT_SIG_PATH}?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`;
   }
 
   // Override execute entirely — Qoder needs:
@@ -336,8 +565,24 @@ export class QoderExecutor extends BaseExecutor {
   //   - COSY headers built from the *encoded* body bytes
   //   - response stream re-wrapped from {statusCodeValue, body} to OpenAI SSE
   async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
-    const url = this.buildUrl();
+    // PAT (pt-...) → exchange for short-lived job token + resolve userId so
+    // downstream COSY signing + catalog fetch work. Device tokens (dt-...) and
+    // job tokens (jt-...) skip this and are used directly.
+    const rawToken = credentials?.apiKey || credentials?.accessToken;
+    if (isQoderPat(rawToken)) {
+      try {
+        credentials = await resolveQoderCredentials(credentials, proxyOptions, signal);
+      } catch (err) {
+        log?.error?.("QODER", `PAT exchange failed: ${err.message}`);
+        const fakeResp = new Response(
+          JSON.stringify({ error: { message: `qoder PAT exchange failed: ${err.message}` } }),
+          { status: 401, headers: { "Content-Type": "application/json" } },
+        );
+        return { response: fakeResp, url: this.buildUrl(credentials), headers: {}, transformedBody: body };
+      }
+    }
 
+    const url = this.buildUrl(credentials);
     const psd = credentials?.providerSpecificData || {};
     if (!psd.userId) {
       // No user id → no way to sign. Surface a 401 so the dashboard nudges
@@ -431,7 +676,7 @@ export class QoderExecutor extends BaseExecutor {
       return { response, url, headers, transformedBody: payload };
     }
 
-    const wrapped = wrapQoderSSE(response, `qoder/${qoderKey}`);
+    const wrapped = await wrapQoderSSE(response, `qoder/${qoderKey}`);
     return { response: wrapped, url, headers, transformedBody: payload };
   }
 
@@ -455,4 +700,5 @@ export const __test__ = {
   normalizeMessages,
   wrapQoderSSE,
   buildQoderRequestBody,
+  isBillingBlock,
 };
