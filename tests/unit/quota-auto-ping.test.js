@@ -22,6 +22,9 @@ vi.mock("@/shared/constants/config", () => ({
     pingLeadMs: 5000,
     refreshAheadMs: 300000,
     failureCooldownMs: 900000,
+    scheduleTimezone: "Asia/Ho_Chi_Minh",
+    scheduleHours: [6, 11, 16, 21],
+    scheduleWindowMinutes: 5,
     providers: {
       claude: {
         settingsKey: "claudeAutoPing",
@@ -33,14 +36,12 @@ vi.mock("@/shared/constants/config", () => ({
       codex: {
         settingsKey: "codexAutoPing",
         quotaKey: "session",
-        pingWhenResetAtSlides: true,
-        resetAtDriftMs: 30000,
-        minPingIntervalMs: 600000,
-        skipWhenBlockingQuotaExhausted: true,
-        pingModel: "gpt-5.5",
+        pingModel: "gpt-5.6-luna",
         pingText: "hi",
         pingInstructions: "Reply with OK.",
-        pingReasoningEffort: "none",
+        pingReasoningEffort: "low",
+        schedule: true,
+        skipWhenBlockingQuotaExhausted: true,
       },
     },
   },
@@ -48,10 +49,6 @@ vi.mock("@/shared/constants/config", () => ({
 
 vi.mock("open-sse/providers/shared.js", () => ({
   CLAUDE_CLI_SPOOF_HEADERS: { "anthropic-version": "2023-06-01" },
-}));
-
-vi.mock("open-sse/services/usage/shared.js", () => ({
-  U: () => ({ baseUrl: "https://chatgpt.com/backend-api/codex/responses" }),
 }));
 
 vi.mock("open-sse/utils/proxyFetch.js", () => ({
@@ -77,8 +74,6 @@ describe("quota auto-ping", () => {
   let state;
   let getCodexUsage;
   let getClaudeUsage;
-  let getExecutor;
-  let codexResponseText;
 
   beforeEach(async () => {
     vi.resetModules();
@@ -88,7 +83,6 @@ describe("quota auto-ping", () => {
 
     ({ getCodexUsage } = await import("open-sse/services/usage/codex.js"));
     ({ getClaudeUsage } = await import("open-sse/services/usage/claude.js"));
-    ({ getExecutor } = await import("open-sse/executors/index.js"));
     ({ runQuotaAutoPingTick, configureQuotaAutoPing } = await import("../../src/shared/services/quotaAutoPing.js"));
 
     deps = {
@@ -99,259 +93,82 @@ describe("quota auto-ping", () => {
       refreshAndUpdateCredentials: vi.fn(async (connection) => ({ connection, refreshed: false })),
       proxyAwareFetch: vi.fn().mockResolvedValue({ ok: true }),
       getExecutor: vi.fn(() => ({
-        execute: vi.fn().mockResolvedValue({ response: { ok: true, text: codexResponseText } }),
+        execute: vi.fn().mockResolvedValue({ response: { ok: true, text: vi.fn().mockResolvedValue("") } }),
       })),
     };
-    codexResponseText = vi.fn().mockResolvedValue("");
-    getExecutor.mockReturnValue({
-      execute: vi.fn().mockResolvedValue({ response: { ok: true, text: codexResponseText } }),
-    });
-    state = { running: false, resetCache: {}, failureCache: {} };
-    vi.setSystemTime(new Date("2026-01-01T12:00:00.000Z"));
+    state = { running: false, resetCache: {}, scheduleCache: {}, failureCache: {} };
   });
 
-  it("does not ping Codex when setting is absent", async () => {
+  it.each([6, 11, 16, 21])("pings every Codex OAuth connection at %sh local time", async (hour) => {
+    const utcHour = (hour + 24 - 7) % 24;
+    vi.setSystemTime(new Date(Date.UTC(2026, 0, 1, utcHour, 2)));
     deps.getSettings.mockResolvedValue({});
-
-    await runQuotaAutoPingTick(deps, state);
-
-    expect(deps.getProviderConnections).not.toHaveBeenCalled();
-    expect(deps.proxyAwareFetch).not.toHaveBeenCalled();
-  });
-
-  it("starts the scheduler only when an account opts in", () => {
-    vi.useFakeTimers();
-
-    configureQuotaAutoPing({ codexAutoPing: { connections: {} } });
-    expect(vi.getTimerCount()).toBe(0);
-
-    configureQuotaAutoPing({ codexAutoPing: { connections: { "codex-1": true } } });
-    expect(vi.getTimerCount()).toBe(1);
-  });
-
-  it("stops the scheduler when the last account opts out", () => {
-    vi.useFakeTimers();
-    configureQuotaAutoPing({ claudeAutoPing: { connections: { "claude-1": true } } });
-
-    configureQuotaAutoPing({ claudeAutoPing: { connections: { "claude-1": false } } });
-
-    expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("does not ping Codex on the first resetAt observation", async () => {
-    deps.getSettings.mockResolvedValue({ codexAutoPing: { connections: { "codex-1": true } } });
-    deps.getProviderConnections.mockImplementation(async ({ provider }) => (
-      provider === "codex" ? [{ id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token" }] : []
-    ));
-    getCodexUsage.mockResolvedValue({
-      quotas: { session: { used: 1, resetAt: "2026-01-01T13:00:00.000Z" } },
-    });
-
-    await runQuotaAutoPingTick(deps, state);
-
-    expect(deps.getExecutor).not.toHaveBeenCalled();
-    expect(deps.updateProviderConnection).not.toHaveBeenCalled();
-    expect(state.resetCache["codex:codex-1"]).toBe("2026-01-01T13:00:00.000Z");
-  });
-
-  it("sends Codex ping when session resetAt slides", async () => {
-    deps.getSettings.mockResolvedValue({ codexAutoPing: { connections: { "codex-1": true } } });
-    deps.getProviderConnections.mockImplementation(async ({ provider }) => (
-      provider === "codex" ? [{ id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token" }] : []
-    ));
-    state.resetCache["codex:codex-1"] = "2026-01-01T17:00:00.000Z";
-    getCodexUsage.mockResolvedValue({
-      quotas: { session: { used: 1, total: 100, remaining: 99, resetAt: "2026-01-01T17:01:00.000Z" } },
-    });
-
-    await runQuotaAutoPingTick(deps, state);
-
-    const executor = deps.getExecutor.mock.results[0].value;
-    expect(executor.execute).toHaveBeenCalledTimes(1);
-    expect(deps.updateProviderConnection).toHaveBeenCalledWith("codex-1", expect.objectContaining({
-      lastPingedResetAt: "2026-01-01T17:01:00.000Z",
-      lastPingedResetKey: "2026-01-01T17:01:00.000Z",
-    }));
-  });
-
-  it("does not ping Codex when resetAt is stable", async () => {
-    deps.getSettings.mockResolvedValue({ codexAutoPing: { connections: { "codex-1": true } } });
-    deps.getProviderConnections.mockImplementation(async ({ provider }) => (
-      provider === "codex" ? [{ id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token" }] : []
-    ));
-    state.resetCache["codex:codex-1"] = "2026-01-01T17:00:00.000Z";
-    getCodexUsage.mockResolvedValue({
-      quotas: { session: { used: 1, total: 100, remaining: 99, resetAt: "2026-01-01T17:00:00.000Z" } },
-    });
-
-    await runQuotaAutoPingTick(deps, state);
-
-    expect(deps.getExecutor).not.toHaveBeenCalled();
-    expect(deps.updateProviderConnection).not.toHaveBeenCalled();
-  });
-
-  it("does not repeat Codex ping inside the minimum ping interval", async () => {
-    deps.getSettings.mockResolvedValue({ codexAutoPing: { connections: { "codex-1": true } } });
     deps.getProviderConnections.mockImplementation(async ({ provider }) => (
       provider === "codex"
-        ? [{ id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token", lastPingAt: "2026-01-01T11:55:00.000Z" }]
+        ? [
+          { id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token-1" },
+          { id: "codex-2", provider: "codex", authType: "oauth", accessToken: "token-2" },
+          { id: "codex-api", provider: "codex", authType: "apikey", accessToken: "token-3" },
+        ]
         : []
     ));
-    state.resetCache["codex:codex-1"] = "2026-01-01T17:00:00.000Z";
-    getCodexUsage.mockResolvedValue({
-      quotas: { session: { used: 1, total: 100, remaining: 99, resetAt: "2026-01-01T17:01:00.000Z" } },
-    });
+    getCodexUsage.mockResolvedValue({ quotas: { session: { used: 1, total: 100, remaining: 99 } } });
 
     await runQuotaAutoPingTick(deps, state);
 
-    expect(deps.getExecutor).not.toHaveBeenCalled();
-    expect(deps.updateProviderConnection).not.toHaveBeenCalled();
-  });
-
-  it("does not ping Codex just because reported usage is zero", async () => {
-    deps.getSettings.mockResolvedValue({ codexAutoPing: { connections: { "codex-1": true } } });
-    deps.getProviderConnections.mockImplementation(async ({ provider }) => (
-      provider === "codex" ? [{ id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token" }] : []
-    ));
-    getCodexUsage.mockResolvedValue({
-      quotas: { session: { used: 0, resetAt: "2026-01-01T17:00:00.000Z" } },
-    });
-
-    await runQuotaAutoPingTick(deps, state);
-
-    expect(deps.getExecutor).not.toHaveBeenCalled();
-    expect(deps.updateProviderConnection).not.toHaveBeenCalled();
-    expect(state.resetCache["codex:codex-1"]).toBe("2026-01-01T17:00:00.000Z");
-  });
-
-  it("does not ping Codex when weekly quota is exhausted", async () => {
-    deps.getSettings.mockResolvedValue({ codexAutoPing: { connections: { "codex-1": true } } });
-    deps.getProviderConnections.mockImplementation(async ({ provider }) => (
-      provider === "codex" ? [{ id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token" }] : []
-    ));
-    state.resetCache["codex:codex-1"] = "2026-01-01T17:00:00.000Z";
-    getCodexUsage.mockResolvedValue({
-      quotas: {
-        session: { used: 0, total: 100, remaining: 100, resetAt: "2026-01-01T17:01:00.000Z" },
-        weekly: { used: 100, total: 100, remaining: 0, resetAt: "2026-01-03T12:00:00.000Z" },
-      },
-    });
-
-    await runQuotaAutoPingTick(deps, state);
-
-    expect(deps.getExecutor).not.toHaveBeenCalled();
-    expect(deps.updateProviderConnection).not.toHaveBeenCalled();
-  });
-
-  it("does not ping Codex when monthly quota is exhausted", async () => {
-    deps.getSettings.mockResolvedValue({ codexAutoPing: { connections: { "codex-1": true } } });
-    deps.getProviderConnections.mockImplementation(async ({ provider }) => (
-      provider === "codex" ? [{ id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token" }] : []
-    ));
-    state.resetCache["codex:codex-1"] = "2026-01-01T17:00:00.000Z";
-    getCodexUsage.mockResolvedValue({
-      quotas: {
-        session: { used: 0, total: 100, remaining: 100, resetAt: "2026-01-01T17:01:00.000Z" },
-        monthly: { used: 100, total: 100, remaining: 0, resetAt: "2026-02-01T00:00:00.000Z" },
-      },
-    });
-
-    await runQuotaAutoPingTick(deps, state);
-
-    expect(deps.getExecutor).not.toHaveBeenCalled();
-    expect(deps.updateProviderConnection).not.toHaveBeenCalled();
-  });
-
-  it("does not ping Codex when session quota is exhausted", async () => {
-    deps.getSettings.mockResolvedValue({ codexAutoPing: { connections: { "codex-1": true } } });
-    deps.getProviderConnections.mockImplementation(async ({ provider }) => (
-      provider === "codex" ? [{ id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token" }] : []
-    ));
-    state.resetCache["codex:codex-1"] = "2026-01-01T17:00:00.000Z";
-    getCodexUsage.mockResolvedValue({
-      quotas: { session: { used: 100, total: 100, remaining: 0, resetAt: "2026-01-01T17:01:00.000Z" } },
-    });
-
-    await runQuotaAutoPingTick(deps, state);
-
-    expect(deps.getExecutor).not.toHaveBeenCalled();
-    expect(deps.updateProviderConnection).not.toHaveBeenCalled();
-  });
-
-  it("sends one tiny gpt-5.5 Codex request through the executor", async () => {
-    deps.getSettings.mockResolvedValue({ codexAutoPing: { connections: { "codex-1": true } } });
-    deps.getProviderConnections.mockImplementation(async ({ provider }) => (
-      provider === "codex"
-        ? [{ id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token", providerSpecificData: { workspaceId: "ws-1" } }]
-        : []
-    ));
-    state.resetCache["codex:codex-1"] = "2026-01-01T17:00:00.000Z";
-    getCodexUsage.mockResolvedValue({
-      quotas: { session: { used: 1, total: 100, remaining: 99, resetAt: "2026-01-01T17:01:00.000Z" } },
-    });
-
-    await runQuotaAutoPingTick(deps, state);
-
-    const executor = deps.getExecutor.mock.results[0].value;
-    expect(deps.getExecutor).toHaveBeenCalledWith("codex");
-    expect(executor.execute).toHaveBeenCalledWith(expect.objectContaining({
-      model: "gpt-5.5",
-      stream: true,
-      credentials: expect.objectContaining({
-        accessToken: "token",
-        connectionId: "codex-1",
-        providerSpecificData: { workspaceId: "ws-1" },
+    expect(deps.getExecutor).toHaveBeenCalledTimes(2);
+    expect(deps.getExecutor.mock.results[0].value.execute).toHaveBeenCalledWith(expect.objectContaining({
+      model: "gpt-5.6-luna",
+      body: expect.objectContaining({
+        model: "gpt-5.6-luna",
+        reasoning: { effort: "low", summary: "auto" },
       }),
-      body: {
-        model: "gpt-5.5",
-        input: [{
-          type: "message",
-          role: "user",
-          content: [{ type: "input_text", text: "hi" }],
-        }],
-        instructions: "Reply with OK.",
-        reasoning: { effort: "none", summary: "auto" },
-        store: false,
-        stream: true,
-      },
     }));
-    expect(codexResponseText).toHaveBeenCalledTimes(1);
+    expect(deps.updateProviderConnection).toHaveBeenCalledTimes(2);
     expect(deps.updateProviderConnection).toHaveBeenCalledWith("codex-1", expect.objectContaining({
-      lastPingedResetAt: "2026-01-01T17:01:00.000Z",
-      lastPingedResetKey: "2026-01-01T17:01:00.000Z",
+      lastAutoPingSlot: expect.stringContaining("T"),
     }));
   });
 
-  it("does not ping same Codex reset twice when seconds drift", async () => {
-    deps.getSettings.mockResolvedValue({ codexAutoPing: { connections: { "codex-1": true } } });
-    deps.getProviderConnections.mockImplementation(async ({ provider }) => (
-      provider === "codex"
-        ? [{ id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token", lastPingedResetAt: "2026-01-01T11:59:44.000Z" }]
-        : []
-    ));
-    state.resetCache["codex:codex-1"] = "2026-01-01T11:59:44.000Z";
-    getCodexUsage.mockResolvedValue({
-      quotas: { session: { used: 0, total: 100, remaining: 100, resetAt: "2026-01-01T11:59:47.000Z" } },
-    });
+  it("does not repeat a connection inside the same scheduled slot", async () => {
+    vi.setSystemTime(new Date("2026-01-01T23:02:00.000Z"));
+    deps.getSettings.mockResolvedValue({});
+    deps.getProviderConnections.mockResolvedValue([
+      { id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token" },
+    ]);
+    getCodexUsage.mockResolvedValue({ quotas: { session: { remaining: 99, total: 100 } } });
+
+    await runQuotaAutoPingTick(deps, state);
+    await runQuotaAutoPingTick(deps, state);
+
+    expect(deps.getExecutor).toHaveBeenCalledTimes(1);
+    expect(deps.updateProviderConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows an explicit false setting to disable one Codex connection", async () => {
+    vi.setSystemTime(new Date("2026-01-01T23:02:00.000Z"));
+    deps.getSettings.mockResolvedValue({ codexAutoPing: { connections: { "codex-1": false } } });
+    deps.getProviderConnections.mockResolvedValue([
+      { id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token" },
+    ]);
 
     await runQuotaAutoPingTick(deps, state);
 
     expect(deps.getExecutor).not.toHaveBeenCalled();
   });
 
-  it("skips non-OAuth Codex connections", async () => {
-    deps.getSettings.mockResolvedValue({ codexAutoPing: { connections: { "codex-1": true } } });
-    deps.getProviderConnections.mockImplementation(async ({ provider }) => (
-      provider === "codex" ? [{ id: "codex-1", provider: "codex", authType: "apikey", accessToken: "token" }] : []
-    ));
+  it("starts Codex auto-ping by default and stops only when globally disabled", () => {
+    vi.useFakeTimers();
 
-    await runQuotaAutoPingTick(deps, state);
+    configureQuotaAutoPing({});
+    expect(vi.getTimerCount()).toBe(1);
 
-    expect(getCodexUsage).not.toHaveBeenCalled();
-    expect(deps.getExecutor).not.toHaveBeenCalled();
+    configureQuotaAutoPing({ codexAutoPing: { enabled: false } });
+    expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("keeps Claude session quota key behavior", async () => {
+  it("keeps Claude reset-based behavior", async () => {
+    vi.setSystemTime(new Date("2026-01-01T12:00:00.000Z"));
     deps.getSettings.mockResolvedValue({ claudeAutoPing: { connections: { "claude-1": true } } });
     deps.getProviderConnections.mockImplementation(async ({ provider }) => (
       provider === "claude" ? [{ id: "claude-1", provider: "claude", authType: "oauth", accessToken: "token" }] : []

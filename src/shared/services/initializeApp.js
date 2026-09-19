@@ -121,8 +121,8 @@ async function runHeavyStartup() {
 }
 
 function hasQuotaAutoPingEnabled(settings) {
-  return [settings?.claudeAutoPing, settings?.codexAutoPing]
-    .some((config) => Object.values(config?.connections || {}).some(Boolean));
+  return settings?.codexAutoPing?.enabled !== false
+    || Object.values(settings?.claudeAutoPing?.connections || {}).some(Boolean);
 }
 
 async function autoStartMitm(settings) {

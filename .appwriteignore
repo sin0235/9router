@@ -1,0 +1,12 @@
+.git/
+.serena/
+.wrangler/
+node_modules/
+.next/
+data/
+logs/
+appwrite.env
+*.sqlite
+*.db
+tests/
+open-sse/test/

@@ -329,7 +329,10 @@ export default function ProviderDetailPage() {
       setThinkingMode(thinkingCfg.mode || "auto");
       const autoPingSettingsKey = AUTO_PING_SETTINGS_KEYS[providerId];
       const apCfg = autoPingSettingsKey ? settingsData[autoPingSettingsKey] || {} : {};
-      setAutoPing({ enabled: apCfg.enabled === true, connections: apCfg.connections || {} });
+      setAutoPing({
+        enabled: providerId === "codex" ? apCfg.enabled !== false : apCfg.enabled === true,
+        connections: apCfg.connections || {},
+      });
       if (nodesRes.ok) {
         let node = (nodesData.nodes || []).find((entry) => entry.id === providerId) || null;
 
@@ -1038,7 +1041,9 @@ export default function ProviderDetailPage() {
                 onMoveDown={() => handleSwapPriority(index, index + 1)}
                 onToggleActive={(isActive) => handleUpdateConnectionStatus(conn.id, isActive)}
                 autoPing={AUTO_PING_SETTINGS_KEYS[providerId] && conn.authType === "oauth" ? {
-                  on: autoPing.connections[conn.id] === true,
+                  on: providerId === "codex"
+                    ? autoPing.enabled !== false && autoPing.connections[conn.id] !== false
+                    : autoPing.connections[conn.id] === true,
                   onToggle: (on) => handleAutoPingConnection(conn.id, on),
                   provider: providerId,
                 } : null}

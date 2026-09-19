@@ -62,12 +62,15 @@ export const CONSOLE_LOG_CONFIG = {
 // Client-side store TTL: how long fetched data stays fresh before re-fetching
 export const CLIENT_STORE_TTL_MS = 60000;
 
-// Quota auto-ping: keep 5h windows warm by sending a tiny request right after reset.
+// Quota auto-ping: send a tiny Codex request at fixed local-time slots.
 export const QUOTA_AUTOPING_CONFIG = {
   tickIntervalMs: 60000,                // scheduler tick
   pingLeadMs: 5000,                     // fire once reset passes (within tolerance)
   refreshAheadMs: 300000,               // refetch usage when within 5min of reset
   failureCooldownMs: 900000,            // avoid failed ping spam while upstream/auth is unhealthy
+  scheduleTimezone: "Asia/Ho_Chi_Minh",
+  scheduleHours: [6, 11, 16, 21],
+  scheduleWindowMinutes: 5,
   providers: {
     claude: {
       settingsKey: "claudeAutoPing",    // preserve existing settings contract
@@ -79,15 +82,13 @@ export const QUOTA_AUTOPING_CONFIG = {
     codex: {
       settingsKey: "codexAutoPing",
       quotaKey: "session",
-      pingWhenResetAtSlides: true,
-      resetAtDriftMs: 30000,
       minPingIntervalMs: 600000,
       skipWhenBlockingQuotaExhausted: true,
-      // Free and Plus Codex accounts both expose gpt-5.5; avoid fallback probes that waste requests.
-      pingModel: "gpt-5.5",
+      schedule: true,
+      pingModel: "gpt-5.6-luna",
       pingText: "hi",
       pingInstructions: "Reply with OK.",
-      pingReasoningEffort: "none",
+      pingReasoningEffort: "low",
     },
   },
 };

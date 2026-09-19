@@ -1,5 +1,6 @@
 import { ensureDirs, DATA_FILE, LEGACY_FILES } from "./paths.js";
 import { initR2Db, isR2DbEnabled, uploadDbToR2, syncR2WithLocal } from "@/lib/r2DbSync.js";
+import { isAppwriteStorageEnabled, uploadDbToAppwrite, syncAppwriteWithLocal } from "@/lib/appwriteStorageSync.js";
 import { initConsoleLogCapture } from "@/lib/consoleLogBuffer.js";
 
 initConsoleLogCapture();
@@ -9,10 +10,17 @@ if (!global._dbAdapter) global._dbAdapter = { instance: null, initPromise: null,
 const state = global._dbAdapter;
 
 const R2_SYNC_INTERVAL_MS = 30000; // Pull from R2 every 30 seconds
+const APPWRITE_SYNC_INTERVAL_MS = 30000;
 
 function queueUploadDbToR2() {
   void uploadDbToR2(DATA_FILE).catch((error) => {
     console.warn(`[R2 DB] Queued upload failed: ${error.message}`);
+  });
+}
+
+function queueUploadDbToAppwrite() {
+  void uploadDbToAppwrite(DATA_FILE).catch((error) => {
+    console.warn(`[Appwrite DB] Queued upload failed: ${error.message}`);
   });
 }
 
@@ -70,7 +78,8 @@ async function trySqlJs() {
 
 async function initAdapter() {
   ensureDirs();
-  const r2Enabled = isR2DbEnabled(DATA_FILE);
+  const appwriteEnabled = isAppwriteStorageEnabled(DATA_FILE);
+  const r2Enabled = !appwriteEnabled && isR2DbEnabled(DATA_FILE);
   if (r2Enabled) {
     await initR2Db(DATA_FILE);
     await initR2Db(LEGACY_FILES.main);
@@ -94,7 +103,22 @@ async function initAdapter() {
   await runMigrationOnce(adapter);
   adapter.checkpoint?.();
 
-  if (!r2Enabled) return adapter;
+  if (!appwriteEnabled && !r2Enabled) return adapter;
+
+  if (appwriteEnabled) {
+    const syncedAdapter = withAppwriteSync(adapter);
+    state.instance = syncedAdapter;
+    await syncAppwriteWithLocal(DATA_FILE);
+    queueUploadDbToAppwrite();
+    if (!state.syncInterval) {
+      state.syncInterval = setInterval(() => {
+        void syncAppwriteWithLocal(DATA_FILE).catch((error) => {
+          console.warn(`[Appwrite DB] Periodic sync failed: ${error.message}`);
+        });
+      }, APPWRITE_SYNC_INTERVAL_MS);
+    }
+    return syncedAdapter;
+  }
 
   const syncedAdapter = withR2Sync(adapter);
   state.instance = syncedAdapter;
@@ -115,6 +139,36 @@ async function initAdapter() {
   }
 
   return syncedAdapter;
+}
+
+function withAppwriteSync(adapter) {
+  function sync() {
+    try {
+      adapter.checkpoint?.();
+    } catch (error) {
+      console.warn(`[DB] SQLite checkpoint failed: ${error.message}`);
+    }
+    queueUploadDbToAppwrite();
+  }
+
+  return {
+    ...adapter,
+    run(sql, params = []) {
+      const result = adapter.run(sql, params);
+      sync();
+      return result;
+    },
+    exec(sql) {
+      const result = adapter.exec(sql);
+      sync();
+      return result;
+    },
+    transaction(fn) {
+      const result = adapter.transaction(fn);
+      sync();
+      return result;
+    },
+  };
 }
 
 function withR2Sync(adapter) {

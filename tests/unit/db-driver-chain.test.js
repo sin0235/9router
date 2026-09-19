@@ -11,11 +11,23 @@ const r2Mock = vi.hoisted(() => ({
   sync: vi.fn(),
 }));
 
+const appwriteMock = vi.hoisted(() => ({
+  isEnabled: vi.fn(() => false),
+  upload: vi.fn(() => Promise.resolve()),
+  sync: vi.fn(() => Promise.resolve()),
+}));
+
 vi.mock("@/lib/r2DbSync.js", () => ({
   isR2DbEnabled: r2Mock.isEnabled,
   initR2Db: r2Mock.init,
   uploadDbToR2: r2Mock.upload,
   syncR2WithLocal: r2Mock.sync,
+}));
+
+vi.mock("@/lib/appwriteStorageSync.js", () => ({
+  isAppwriteStorageEnabled: appwriteMock.isEnabled,
+  uploadDbToAppwrite: appwriteMock.upload,
+  syncAppwriteWithLocal: appwriteMock.sync,
 }));
 
 let tempDir;
@@ -29,6 +41,11 @@ beforeEach(() => {
   r2Mock.init.mockReset();
   r2Mock.upload.mockReset();
   r2Mock.sync.mockReset();
+  appwriteMock.isEnabled.mockReturnValue(false);
+  appwriteMock.upload.mockReset();
+  appwriteMock.upload.mockResolvedValue(undefined);
+  appwriteMock.sync.mockReset();
+  appwriteMock.sync.mockResolvedValue(undefined);
   vi.resetModules();
 });
 
@@ -50,6 +67,18 @@ describe("Driver fallback chain", () => {
     expect(r2Mock.init).not.toHaveBeenCalled();
     expect(r2Mock.sync).not.toHaveBeenCalled();
     expect(r2Mock.upload).not.toHaveBeenCalled();
+  });
+
+  it("dùng Appwrite Storage làm backend đồng bộ khi được bật", async () => {
+    appwriteMock.isEnabled.mockReturnValue(true);
+    const { getAdapter } = await import("@/lib/db/driver.js");
+    const db = await getAdapter();
+
+    db.run("SELECT 1");
+
+    expect(appwriteMock.sync).toHaveBeenCalled();
+    expect(appwriteMock.upload).toHaveBeenCalled();
+    expect(r2Mock.sync).not.toHaveBeenCalled();
   });
 
   it("default → picks better-sqlite3 when available", async () => {

@@ -62,8 +62,14 @@ const AUTO_PING_SETTINGS_KEYS = {
 
 const AUTO_PING_TOOLTIPS = {
   claude: "When your 5h quota runs out, auto-sends a request the moment it resets so a new window starts right away.",
-  codex: "Auto-starts the next 5h Codex window after reset by sending a tiny gpt-5.5 request. Consumes a small amount of quota.",
+  codex: "Sends a tiny gpt-5.6-luna request daily at 06:00, 11:00, 16:00, and 21:00 (Vietnam time) with low reasoning.",
 };
+
+function isAutoPingEnabled(provider, maps, connectionId) {
+  return provider === "codex"
+    ? maps[provider]?.[connectionId] !== false
+    : maps[provider]?.[connectionId] === true;
+}
 
 function kiroMethodLabel(conn) {
   const m = conn.providerSpecificData?.authMethod;
@@ -1187,9 +1193,9 @@ export default function ProviderLimits() {
                       <Tooltip text={AUTO_PING_TOOLTIPS[conn.provider]}>
                         <button
                           type="button"
-                          onClick={() => toggleAutoPing(conn.id, conn.provider, !(autoPingMaps[conn.provider]?.[conn.id] === true))}
+                          onClick={() => toggleAutoPing(conn.id, conn.provider, !isAutoPingEnabled(conn.provider, autoPingMaps, conn.id))}
                           aria-label="Toggle auto-ping"
-                          className={`flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5 ${autoPingMaps[conn.provider]?.[conn.id] === true ? "text-primary" : "text-text-muted"}`}
+                          className={`flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5 ${isAutoPingEnabled(conn.provider, autoPingMaps, conn.id) ? "text-primary" : "text-text-muted"}`}
                         >
                           <span className="material-symbols-outlined text-[18px]">bolt</span>
                         </button>

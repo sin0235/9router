@@ -29,6 +29,7 @@ const DEFAULT_SETTINGS = {
   stickyRoundRobinLimit: 3,
   providerStrategies: {},
   quotaVisibility: {},
+  codexAutoPing: { enabled: true, connections: {} },
   comboStrategy: "fallback",
   comboStickyRoundRobinLimit: 1,
   comboStrategies: {},
