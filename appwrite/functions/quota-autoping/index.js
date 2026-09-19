@@ -22,7 +22,6 @@ export async function handleQuotaAutoPing({ res, log = () => {}, error = () => {
     const response = await fetch(endpoint, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${config.secret}`,
         "x-quota-autoping-secret": config.secret,
         accept: "application/json",
       },

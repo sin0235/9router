@@ -52,6 +52,7 @@ describe("Appwrite-safe quota auto-ping header", () => {
         headers: expect.objectContaining({ "x-quota-autoping-secret": "test-secret" }),
       }),
     );
+    expect(fetch.mock.calls[0][1].headers).not.toHaveProperty("authorization");
   });
 
   it("prefers the rotated V2 secret when configured", async () => {

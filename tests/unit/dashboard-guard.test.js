@@ -214,6 +214,14 @@ describe("dashboard guard public LLM API access", () => {
     expect(response).toBe(mocks.nextResponse);
     expect(mocks.validateApiKey).toHaveBeenCalledWith("sk-valid");
   });
+
+  it("allows the secret-protected quota auto-ping route through the API guard", async () => {
+    const response = await proxy(request("/api/internal/quota-autoping", {
+      host: "api-9router.sin-studio.tech",
+    }));
+
+    expect(response).toBe(mocks.nextResponse);
+  });
 });
 
 describe("dashboard guard local-only access", () => {

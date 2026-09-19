@@ -34,7 +34,7 @@ describe("Appwrite quota auto-ping Function", () => {
       "https://sin-studio.tech/api/internal/quota-autoping",
       expect.objectContaining({
         method: "POST",
-        headers: expect.objectContaining({ authorization: "Bearer test-secret" }),
+        headers: expect.objectContaining({ "x-quota-autoping-secret": "test-secret" }),
       }),
     );
     expect(result).toEqual(expect.objectContaining({ status: 200 }));
