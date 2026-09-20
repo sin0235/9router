@@ -74,10 +74,12 @@ describe("Driver fallback chain", () => {
     const { getAdapter } = await import("@/lib/db/driver.js");
     const db = await getAdapter();
 
-    db.run("SELECT 1");
-
     expect(appwriteMock.sync).toHaveBeenCalled();
-    expect(appwriteMock.upload).toHaveBeenCalled();
+    expect(appwriteMock.upload).not.toHaveBeenCalled();
+    db.run("SELECT 1");
+    expect(appwriteMock.upload).not.toHaveBeenCalled();
+    db.run("INSERT INTO kv(scope, key, value) VALUES ('test', 'sync-test', '1')");
+    expect(appwriteMock.upload).toHaveBeenCalledTimes(1);
     expect(r2Mock.sync).not.toHaveBeenCalled();
   });
 

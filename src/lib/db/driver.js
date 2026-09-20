@@ -24,6 +24,10 @@ function queueUploadDbToAppwrite() {
   });
 }
 
+function isMutatingSql(sql) {
+  return !/^\s*(?:SELECT|PRAGMA|EXPLAIN)\b/i.test(String(sql));
+}
+
 async function tryBunSqlite() {
   // Bun runtime only — built-in, no install needed
   if (!process.versions.bun) return null;
@@ -109,7 +113,6 @@ async function initAdapter() {
     const syncedAdapter = withAppwriteSync(adapter);
     state.instance = syncedAdapter;
     await syncAppwriteWithLocal(DATA_FILE);
-    queueUploadDbToAppwrite();
     if (!state.syncInterval) {
       state.syncInterval = setInterval(() => {
         void syncAppwriteWithLocal(DATA_FILE).catch((error) => {
@@ -155,12 +158,12 @@ function withAppwriteSync(adapter) {
     ...adapter,
     run(sql, params = []) {
       const result = adapter.run(sql, params);
-      sync();
+      if (isMutatingSql(sql)) sync();
       return result;
     },
     exec(sql) {
       const result = adapter.exec(sql);
-      sync();
+      if (isMutatingSql(sql)) sync();
       return result;
     },
     transaction(fn) {

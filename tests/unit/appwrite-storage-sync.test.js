@@ -112,4 +112,82 @@ describe("Appwrite Storage DB sync", () => {
       { source: "sync" }
     );
   });
+
+  it("yêu cầu Appwrite trả snapshot mới nhất theo updatedAt", async () => {
+    const remotePayload = encryptedPayload({
+      settings: { cloudEnabled: false },
+      providerConnections: [],
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        files: [
+          {
+            $id: "9router-db-old",
+            $updatedAt: "2026-09-19T00:00:00.000+00:00",
+          },
+          {
+            $id: "9router-db-new",
+            $updatedAt: "2026-09-20T00:00:00.000+00:00",
+          },
+        ],
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(remotePayload, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { syncAppwriteWithLocal } = await importFreshSync();
+    await syncAppwriteWithLocal("/tmp/data.sqlite");
+
+    const listUrl = new URL(fetchMock.mock.calls[0][0]);
+    expect(listUrl.searchParams.get("sortDesc[]")).toBe("$updatedAt");
+    expect(fetchMock.mock.calls[1][0]).toContain("/files/9router-db-new/download");
+  });
+
+  it("không upload ngược payload vừa kéo từ cloud", async () => {
+    const remotePayload = encryptedPayload({
+      settings: { cloudEnabled: false },
+      providerConnections: [],
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        files: [{
+          $id: "9router-db-remote",
+          $updatedAt: "2026-09-20T00:00:00.000+00:00",
+        }],
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(remotePayload, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const syncModule = await importFreshSync();
+    dbMock.importDb.mockImplementation(async () => {
+      void syncModule.uploadDbToAppwrite("/tmp/data.sqlite");
+    });
+
+    await syncModule.syncAppwriteWithLocal("/tmp/data.sqlite");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
+  });
+
+  it("gom các upload liên tiếp thành một lần ghi", async () => {
+    dbMock.exportDb.mockResolvedValue({ settings: { cloudEnabled: true } });
+    let uploadCount = 0;
+    const fetchMock = vi.fn(async (_url, options = {}) => {
+      if (options.method === "POST") {
+        uploadCount += 1;
+        return new Response(JSON.stringify({
+          $id: `9router-db-upload-${uploadCount}`,
+          $updatedAt: `2026-09-20T00:00:0${uploadCount}.000+00:00`,
+        }), { status: 201 });
+      }
+      return new Response(JSON.stringify({ files: [] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { uploadDbToAppwrite } = await importFreshSync();
+    await Promise.all([
+      uploadDbToAppwrite("/tmp/data.sqlite"),
+      uploadDbToAppwrite("/tmp/data.sqlite"),
+    ]);
+
+    expect(uploadCount).toBe(1);
+  });
 });

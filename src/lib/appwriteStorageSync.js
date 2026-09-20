@@ -9,7 +9,11 @@ const state = {
   remoteUpdatedAt: null,
   remoteFileId: null,
   isPulling: false,
+  isImporting: false,
   pendingUpload: false,
+  uploadGeneration: 0,
+  uploadPath: null,
+  uploadScheduled: false,
   nextUploadRetryAt: 0,
 };
 
@@ -53,7 +57,11 @@ function fileUrl(fileId, suffix = "") {
 
 async function getLatestFileMetadata() {
   const { filePrefix } = getConfig();
-  const response = await fetch(`${filesUrl()}?limit=100`, { headers: getHeaders() });
+  const query = new URLSearchParams({
+    limit: "100",
+    "sortDesc[]": "$updatedAt",
+  });
+  const response = await fetch(`${filesUrl()}?${query}`, { headers: getHeaders() });
   if (response.status === 404) return null;
   if (!response.ok) throw new Error(`Appwrite file list request failed: ${response.status}`);
   const files = (await response.json()).files || [];
@@ -128,17 +136,27 @@ async function pullFile(localPath, fileId) {
   const payload = parsePayload(decryptDb(await downloadFile(fileId)));
   if (localPath?.endsWith(".sqlite")) {
     const { importDb } = await import("@/lib/db/index.js");
-    await importDb(payload, { source: "sync" });
+    state.isImporting = true;
+    try {
+      await importDb(payload, { source: "sync" });
+    } finally {
+      state.isImporting = false;
+    }
   }
   return payload;
 }
 
-async function uploadFile(localPath) {
+async function uploadFile(localPath, generation = state.uploadGeneration) {
   const metadata = await getLatestFileMetadata();
-  if (state.remoteUpdatedAt && metadata?.$updatedAt && metadata.$updatedAt !== state.remoteUpdatedAt) {
+  if (metadata && (
+    !state.remoteFileId
+    || !state.remoteUpdatedAt
+    || metadata.$id !== state.remoteFileId
+    || metadata.$updatedAt !== state.remoteUpdatedAt
+  )) {
     console.warn(`[Appwrite DB] Upload deferred: remote file changed (${metadata.$updatedAt})`);
     state.pendingUpload = true;
-    return;
+    return false;
   }
 
   const form = new FormData();
@@ -157,7 +175,7 @@ async function uploadFile(localPath) {
   const result = await response.json();
   state.remoteUpdatedAt = result.$updatedAt || new Date().toISOString();
   state.remoteFileId = result.$id || fileId;
-  state.pendingUpload = false;
+  if (generation === state.uploadGeneration) state.pendingUpload = false;
   state.nextUploadRetryAt = 0;
   lastQueueError = null;
   if (metadata && metadata.$id !== state.remoteFileId) {
@@ -165,6 +183,7 @@ async function uploadFile(localPath) {
     if (!cleanup.ok) console.warn(`[Appwrite DB] Old file cleanup failed: ${cleanup.status}`);
   }
   console.log(`[Appwrite DB] Uploaded ${state.remoteFileId}`);
+  return true;
 }
 
 function queueError(error) {
@@ -177,15 +196,25 @@ function queueError(error) {
 
 export async function uploadDbToAppwrite(localPath) {
   if (!isAppwriteStorageEnabled()) return;
+  if (state.isImporting) return;
   state.pendingUpload = true;
+  state.uploadGeneration += 1;
+  state.uploadPath = localPath;
+  if (state.uploadScheduled) return syncQueue;
+  state.uploadScheduled = true;
   syncQueue = syncQueue.catch(queueError).then(async () => {
-    if (state.isPulling || Date.now() < state.nextUploadRetryAt) return;
-    try {
-      await uploadFile(localPath);
-    } catch (error) {
-      state.nextUploadRetryAt = Date.now() + RETRY_COOLDOWN_MS;
-      throw error;
+    while (state.pendingUpload && !state.isPulling) {
+      if (Date.now() < state.nextUploadRetryAt) return;
+      try {
+        const uploaded = await uploadFile(state.uploadPath, state.uploadGeneration);
+        if (!uploaded) return;
+      } catch (error) {
+        state.nextUploadRetryAt = Date.now() + RETRY_COOLDOWN_MS;
+        throw error;
+      }
     }
+  }).finally(() => {
+    state.uploadScheduled = false;
   });
   return syncQueue;
 }
@@ -198,17 +227,21 @@ export async function syncAppwriteWithLocal(localPath) {
     try {
       const metadata = await getLatestFileMetadata();
       if (!metadata) {
-        if (state.pendingUpload) await uploadFile(localPath);
+        state.remoteUpdatedAt = null;
+        state.remoteFileId = null;
+        if (state.pendingUpload) await uploadFile(localPath, state.uploadGeneration);
         return;
       }
-      if (metadata.$updatedAt === state.remoteUpdatedAt) {
-        if (state.pendingUpload) await uploadFile(localPath);
+      const remoteChanged = metadata.$id !== state.remoteFileId
+        || metadata.$updatedAt !== state.remoteUpdatedAt;
+      if (remoteChanged) {
+        await pullFile(localPath, metadata.$id);
+        state.remoteUpdatedAt = metadata.$updatedAt || null;
+        state.remoteFileId = metadata.$id;
+        state.pendingUpload = false;
         return;
       }
-      await pullFile(localPath, metadata.$id);
-      state.remoteUpdatedAt = metadata.$updatedAt || null;
-      state.remoteFileId = metadata.$id;
-      if (state.pendingUpload) await uploadFile(localPath);
+      if (state.pendingUpload) await uploadFile(localPath, state.uploadGeneration);
     } finally {
       state.isPulling = false;
     }

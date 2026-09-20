@@ -107,7 +107,7 @@ async function runHeavyStartup() {
 
   configureTunnelMonitoring(settings);
 
-  if (hasQuotaAutoPingEnabled(settings)) {
+  if (process.env.APPWRITE_DB_SYNC_ENABLED !== "true" && hasQuotaAutoPingEnabled(settings)) {
     import("@/shared/services/quotaAutoPing")
       .then(({ startQuotaAutoPing }) => startQuotaAutoPing())
       .catch((e) => console.log("[AutoPing] scheduler start failed:", e.message));
