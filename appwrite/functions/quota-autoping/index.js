@@ -8,6 +8,13 @@ function getConfig() {
   return { targetUrl, secret };
 }
 
+const RETRY_ATTEMPTS = 2;
+const RETRY_DELAY_MS = 1000;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function handleQuotaAutoPing({ res, log = () => {}, error = () => {} }) {
   let config;
   try {
@@ -18,27 +25,35 @@ export async function handleQuotaAutoPing({ res, log = () => {}, error = () => {
   }
 
   const endpoint = `${config.targetUrl}/api/internal/quota-autoping`;
-  try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "x-quota-autoping-secret": config.secret,
-        accept: "application/json",
-      },
-      signal: AbortSignal.timeout(55000),
-    });
+  let lastError;
+  for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "x-quota-autoping-secret": config.secret,
+          accept: "application/json",
+        },
+        signal: AbortSignal.timeout(55000),
+      });
+      let payload = null;
+      try { payload = await response.json(); } catch { /* empty response */ }
 
-    if (!response.ok) {
-      error(`Site returned HTTP ${response.status}`);
-      return res.json({ ok: false, error: "Site trigger failed", status: response.status }, 502);
+      if (response.ok && payload?.ok === true) {
+        log(`Site auto-ping trigger accepted with HTTP ${response.status} (attempt ${attempt})`);
+        return res.json({ ok: true, status: response.status, attempts: attempt }, 200);
+      }
+
+      lastError = new Error(payload?.error || `Site returned HTTP ${response.status}`);
+    } catch (cause) {
+      lastError = cause;
     }
 
-    log(`Site auto-ping trigger accepted with HTTP ${response.status}`);
-    return res.json({ ok: true, status: response.status }, 200);
-  } catch (cause) {
-    error(`Site trigger request failed: ${cause.message}`);
-    return res.json({ ok: false, error: "Site trigger request failed" }, 502);
+    if (attempt < RETRY_ATTEMPTS) await sleep(RETRY_DELAY_MS);
   }
+
+  error(`Site trigger failed after ${RETRY_ATTEMPTS} attempts: ${lastError?.message || "unknown error"}`);
+  return res.json({ ok: false, error: "Site trigger failed" }, 502);
 }
 
 export default handleQuotaAutoPing;

@@ -60,4 +60,18 @@ describe("Appwrite quota auto-ping Function", () => {
     expect(result.status).toBe(502);
     expect(response.json).toHaveBeenCalledWith(expect.objectContaining({ ok: false }), 502);
   });
+
+  it("retries a failed Site trigger and accepts a later success", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: false }), { status: 502 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const response = { json: vi.fn((body, status = 200) => ({ body, status })) };
+
+    const result = await handleQuotaAutoPing({ res: response, log: vi.fn(), error: vi.fn() });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ status: 200 });
+    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({ ok: true, attempts: 2 }), 200);
+  });
 });

@@ -22,6 +22,8 @@ vi.mock("@/shared/constants/config", () => ({
     pingLeadMs: 5000,
     refreshAheadMs: 300000,
     failureCooldownMs: 900000,
+    retryAttempts: 2,
+    retryDelayMs: 0,
     scheduleTimezone: "Asia/Ho_Chi_Minh",
     scheduleHours: [6, 11, 16, 21],
     scheduleWindowMinutes: 5,
@@ -112,7 +114,7 @@ describe("quota auto-ping", () => {
         ]
         : []
     ));
-    getCodexUsage.mockResolvedValue({ quotas: { session: { used: 1, total: 100, remaining: 99 } } });
+    getCodexUsage.mockResolvedValue({ plan: "Plus", quotas: { session: { used: 1, total: 100, remaining: 99 } } });
 
     await runQuotaAutoPingTick(deps, state);
 
@@ -130,13 +132,63 @@ describe("quota auto-ping", () => {
     }));
   });
 
+  it("skips Codex accounts that are not Plus", async () => {
+    vi.setSystemTime(new Date("2026-01-01T23:02:00.000Z"));
+    deps.getSettings.mockResolvedValue({});
+    deps.getProviderConnections.mockResolvedValue([
+      { id: "codex-free", provider: "codex", authType: "oauth", accessToken: "token" },
+    ]);
+    getCodexUsage.mockResolvedValue({ plan: "Free", quotas: { session: { remaining: 99, total: 100 } } });
+
+    const summary = await runQuotaAutoPingTick(deps, state);
+
+    expect(summary).toMatchObject({ attempted: 1, sent: 0, skipped: 1, failed: 0 });
+    expect(deps.getExecutor).not.toHaveBeenCalled();
+    expect(deps.updateProviderConnection).not.toHaveBeenCalled();
+  });
+
+  it("retries usage and ping failures before succeeding", async () => {
+    vi.setSystemTime(new Date("2026-01-01T23:02:00.000Z"));
+    deps.getSettings.mockResolvedValue({});
+    deps.getProviderConnections.mockResolvedValue([
+      { id: "codex-plus", provider: "codex", authType: "oauth", accessToken: "token" },
+    ]);
+    getCodexUsage
+      .mockResolvedValueOnce({ message: "token expired" })
+      .mockResolvedValueOnce({ plan: "Plus", quotas: { session: { remaining: 99, total: 100 } } });
+    const execute = vi.fn()
+      .mockResolvedValueOnce({ response: { ok: false, body: { cancel: vi.fn() } } })
+      .mockResolvedValueOnce({ response: { ok: true, text: vi.fn().mockResolvedValue("") } });
+    deps.getExecutor.mockReturnValue({ execute });
+
+    const summary = await runQuotaAutoPingTick(deps, state);
+
+    expect(getCodexUsage).toHaveBeenCalledTimes(2);
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(summary).toMatchObject({ attempted: 1, sent: 1, failed: 0, retries: 2 });
+  });
+
+  it("does not ping when usage stays unavailable", async () => {
+    vi.setSystemTime(new Date("2026-01-01T23:02:00.000Z"));
+    deps.getSettings.mockResolvedValue({});
+    deps.getProviderConnections.mockResolvedValue([
+      { id: "codex-plus", provider: "codex", authType: "oauth", accessToken: "token" },
+    ]);
+    getCodexUsage.mockResolvedValue({ message: "Codex usage temporarily unavailable" });
+
+    const summary = await runQuotaAutoPingTick(deps, state);
+
+    expect(summary).toMatchObject({ attempted: 1, sent: 0, failed: 1 });
+    expect(deps.getExecutor).not.toHaveBeenCalled();
+  });
+
   it("does not repeat a connection inside the same scheduled slot", async () => {
     vi.setSystemTime(new Date("2026-01-01T23:02:00.000Z"));
     deps.getSettings.mockResolvedValue({});
     deps.getProviderConnections.mockResolvedValue([
       { id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token" },
     ]);
-    getCodexUsage.mockResolvedValue({ quotas: { session: { remaining: 99, total: 100 } } });
+    getCodexUsage.mockResolvedValue({ plan: "Plus", quotas: { session: { remaining: 99, total: 100 } } });
 
     await runQuotaAutoPingTick(deps, state);
     await runQuotaAutoPingTick(deps, state);

@@ -65,4 +65,16 @@ describe("quota auto-ping trigger route", () => {
     expect(response.status).toBe(500);
     expect(await response.json()).toMatchObject({ ok: false });
   });
+
+  it("returns an error when an account fails inside the tick", async () => {
+    runQuotaAutoPingTick.mockResolvedValueOnce({ attempted: 1, sent: 0, skipped: 0, failed: 1, retries: 1 });
+
+    const response = await POST(new Request("http://localhost/api/internal/quota-autoping", {
+      method: "POST",
+      headers: { authorization: "Bearer test-secret" },
+    }));
+
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({ ok: false, summary: { failed: 1 } });
+  });
 });

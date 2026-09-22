@@ -27,10 +27,14 @@ export async function POST(request) {
 
   const startedAt = new Date().toISOString();
   try {
-    await runQuotaAutoPingTick();
+    const summary = await runQuotaAutoPingTick();
     const finishedAt = new Date().toISOString();
+    if (summary?.failed > 0) {
+      console.error(`[AutoPing] ${summary.failed} account(s) failed`);
+      return NextResponse.json({ ok: false, error: "Auto-ping failed", summary }, { status: 502 });
+    }
     console.log(`[AutoPing] Function trigger completed at ${finishedAt}`);
-    return NextResponse.json({ ok: true, startedAt, finishedAt });
+    return NextResponse.json({ ok: true, startedAt, finishedAt, summary });
   } catch (error) {
     console.error(`[AutoPing] Function trigger failed: ${error.message}`);
     return NextResponse.json({ ok: false, error: "Auto-ping failed" }, { status: 500 });

@@ -122,6 +122,62 @@ function buildProxyOptions(cfg) {
   };
 }
 
+function sleep(ms) {
+  return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
+}
+
+function isPlusCodexAccount(connection, usage) {
+  const livePlan = typeof usage?.plan === "string" && usage.plan.toLowerCase() !== "unknown"
+    ? usage.plan
+    : connection.providerSpecificData?.chatgptPlanType;
+  return typeof livePlan === "string" && livePlan.toLowerCase().includes("plus");
+}
+
+async function getUsageWithRetry(connection, handler, proxyOptions, deps) {
+  let current = connection;
+  let forceRefresh = false;
+  let lastError;
+  const attempts = Math.max(1, C.retryAttempts || 1);
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const refreshed = await deps.refreshAndUpdateCredentials(current, forceRefresh, proxyOptions);
+      current = refreshed?.connection || current;
+      const usage = await handler.getUsage(current.accessToken, proxyOptions);
+      if (usage?.message) throw new Error(usage.message);
+      if (!usage?.quotas || typeof usage.quotas !== "object") {
+        throw new Error("Usage response did not include quota data");
+      }
+      return { connection: current, usage, retries: attempt };
+    } catch (error) {
+      lastError = error;
+      forceRefresh = /expired|auth|unauthorized|401|re-authorize/i.test(error.message || "");
+      if (attempt + 1 < attempts) await sleep(C.retryDelayMs);
+    }
+  }
+
+  throw lastError || new Error("Unable to fetch usage");
+}
+
+async function sendPingWithRetry(connection, providerConfig, proxyOptions, deps, handler) {
+  let lastError;
+  const attempts = Math.max(1, C.retryAttempts || 1);
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      if (await handler.sendPing(connection, providerConfig, proxyOptions, deps)) {
+        return attempt;
+      }
+      lastError = new Error("Provider rejected auto-ping request");
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt + 1 < attempts) await sleep(C.retryDelayMs);
+  }
+
+  throw lastError || new Error("Auto-ping failed");
+}
+
 async function sendClaudePing(connection, providerConfig, proxyOptions, deps) {
   const res = await deps.proxyAwareFetch(CLAUDE_PING_URL, {
     method: "POST",
@@ -222,19 +278,19 @@ async function pingConnection(conn, provider, providerConfig, handler, deps, sta
   const proxyCfg = await deps.resolveConnectionProxyConfig(conn.providerSpecificData);
   const proxyOptions = buildProxyOptions(proxyCfg);
 
-  let connection = conn;
-  try {
-    const r = await deps.refreshAndUpdateCredentials(connection, false, proxyOptions);
-    connection = r.connection;
-  } catch (e) {
-    state.failureCache[key] = Date.now();
-    console.warn(`[AutoPing] ${provider}:${conn.id}: refresh failed: ${e.message}`);
-    return;
-  }
-
-  const usage = await handler.getUsage(connection.accessToken, proxyOptions);
+  const { connection, usage, retries: usageRetries } = await getUsageWithRetry(
+    conn,
+    handler,
+    proxyOptions,
+    deps,
+  );
   const quotas = usage?.quotas || {};
   const quota = quotas?.[providerConfig.quotaKey];
+
+  if (provider === "codex" && !isPlusCodexAccount(connection, usage)) {
+    console.log(`[AutoPing] ${provider}:${conn.id}: skipped non-Plus account`);
+    return;
+  }
 
   if (providerConfig.skipWhenBlockingQuotaExhausted && hasExhaustedBlockingQuota(quotas, providerConfig.quotaKey)) return;
   if (quota && isQuotaExhausted(quota)) return;
@@ -254,13 +310,7 @@ async function pingConnection(conn, provider, providerConfig, handler, deps, sta
   }
   if (wasPingedRecently(connection, providerConfig.minPingIntervalMs, now)) return;
 
-  const ok = await handler.sendPing(connection, providerConfig, proxyOptions, deps);
-  if (!ok) {
-    // Do not mark reset as pinged unless upstream accepted the tiny request.
-    state.failureCache[key] = Date.now();
-    console.warn(`[AutoPing] ${provider}:${connection.id}: ping failed (reset ${resetAt})`);
-    return;
-  }
+  const pingRetries = await sendPingWithRetry(connection, providerConfig, proxyOptions, deps, handler);
 
   delete state.failureCache[key];
   const pingState = {
@@ -275,6 +325,7 @@ async function pingConnection(conn, provider, providerConfig, handler, deps, sta
   await deps.updateProviderConnection(connection.id, pingState);
   if (scheduledSlot) state.scheduleCache[key] = scheduledSlot;
   console.log(`[AutoPing] ${provider}:${connection.id}: ping sent${scheduledSlot ? ` (${scheduledSlot})` : ` (reset ${resetAt})`}`);
+  return { sent: true, retries: usageRetries + pingRetries };
 }
 
 function createDefaultDeps() {
@@ -290,7 +341,8 @@ function createDefaultDeps() {
 }
 
 export async function runQuotaAutoPingTick(deps = createDefaultDeps(), state = g) {
-  if (state.running) return;
+  const summary = { attempted: 0, sent: 0, skipped: 0, failed: 0, retries: 0 };
+  if (state.running) return { ...summary, busy: true };
   state.running = true;
   try {
     const settings = await deps.getSettings();
@@ -308,19 +360,26 @@ export async function runQuotaAutoPingTick(deps = createDefaultDeps(), state = g
         provider === "codex" ? enabledMap[conn.id] !== false : enabledMap[conn.id] === true
       ));
       for (const conn of targets) {
+        summary.attempted += 1;
         try {
-          await pingConnection(conn, provider, providerConfig, handler, deps, state);
+          const result = await pingConnection(conn, provider, providerConfig, handler, deps, state);
+          summary.retries += result?.retries || 0;
+          if (result?.sent) summary.sent += 1;
+          else summary.skipped += 1;
         } catch (e) {
+          summary.failed += 1;
           state.failureCache[cacheKey(provider, conn.id)] = Date.now();
           console.warn(`[AutoPing] ${provider}:${conn.id}: ${e.message}`);
         }
       }
     }
   } catch (e) {
+    summary.failed += 1;
     console.warn("[AutoPing] tick error:", e.message);
   } finally {
     state.running = false;
   }
+  return summary;
 }
 
 export function startQuotaAutoPing() {

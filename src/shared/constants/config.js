@@ -68,6 +68,8 @@ export const QUOTA_AUTOPING_CONFIG = {
   pingLeadMs: 5000,                     // fire once reset passes (within tolerance)
   refreshAheadMs: 300000,               // refetch usage when within 5min of reset
   failureCooldownMs: 900000,            // avoid failed ping spam while upstream/auth is unhealthy
+  retryAttempts: 2,
+  retryDelayMs: 1000,
   scheduleTimezone: "Asia/Ho_Chi_Minh",
   scheduleHours: [6, 11, 16, 21],
   scheduleWindowMinutes: 5,
