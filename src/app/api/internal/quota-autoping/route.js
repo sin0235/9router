@@ -29,6 +29,10 @@ export async function POST(request) {
   try {
     const summary = await runQuotaAutoPingTick();
     const finishedAt = new Date().toISOString();
+    if (summary?.busy) {
+      console.warn("[AutoPing] Function trigger skipped because another tick is running");
+      return NextResponse.json({ ok: false, error: "Auto-ping tick already running", summary }, { status: 503 });
+    }
     if (summary?.failed > 0) {
       console.error(`[AutoPing] ${summary.failed} account(s) failed`);
       return NextResponse.json({ ok: false, error: "Auto-ping failed", summary }, { status: 502 });
