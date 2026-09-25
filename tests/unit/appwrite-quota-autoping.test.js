@@ -50,7 +50,7 @@ describe("Appwrite quota auto-ping Function", () => {
     const response = { json: vi.fn((body, status = 200) => ({ body, status })) };
 
     const result = await handleQuotaAutoPing({
-      req: { headers: { "x-quota-autoping-catch-up": "codex" } },
+      req: { bodyText: '{"catchUp":"codex"}', bodyJson: { catchUp: "codex" } },
       res: response,
       log: vi.fn(),
       error: vi.fn(),
@@ -61,6 +61,24 @@ describe("Appwrite quota auto-ping Function", () => {
       expect.objectContaining({ method: "POST" }),
     );
     expect(result).toMatchObject({ status: 200, body: { ok: true, sent: 1 } });
+  });
+
+  it("does not parse the empty body of a scheduled execution", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const response = { json: vi.fn((body, status = 200) => ({ body, status })) };
+    const req = {
+      bodyText: "",
+      get bodyJson() { throw new SyntaxError("Unexpected end of JSON input"); },
+    };
+
+    const result = await handleQuotaAutoPing({ req, res: response, log: vi.fn(), error: vi.fn() });
+
+    expect(result.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://sin-studio.tech/api/internal/quota-autoping",
+      expect.objectContaining({ method: "POST" }),
+    );
   });
 
   it("fails closed when Function variables are missing", async () => {

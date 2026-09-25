@@ -24,8 +24,8 @@ export async function handleQuotaAutoPing({ req, res, log = () => {}, error = ()
     return res.json({ ok: false, error: cause.message }, 500);
   }
 
-  const codexCatchUp = req?.bodyJson?.catchUp === "codex"
-    || req?.headers?.["x-quota-autoping-catch-up"] === "codex";
+  const codexCatchUp = req?.headers?.["x-quota-autoping-catch-up"] === "codex"
+    || (req?.bodyText?.trim() && req.bodyJson?.catchUp === "codex");
   const endpoint = `${config.targetUrl}/api/internal/quota-autoping${codexCatchUp ? "?catchUp=codex" : ""}`;
   let lastError;
   for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt += 1) {
