@@ -44,7 +44,7 @@ function normalizeResetKey(resetAt) {
   return new Date(Math.floor(ms / 60000) * 60000).toISOString();
 }
 
-function getScheduledSlot(providerConfig, nowMs = Date.now()) {
+function getScheduledSlot(providerConfig, nowMs = Date.now(), codexCatchUp = false) {
   if (!providerConfig.schedule) return null;
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: C.scheduleTimezone,
@@ -58,8 +58,11 @@ function getScheduledSlot(providerConfig, nowMs = Date.now()) {
   const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
   const hour = Number(values.hour);
   const minute = Number(values.minute);
-  if (!C.scheduleHours.includes(hour) || minute >= (C.scheduleWindowMinutes || 1)) return null;
-  return `${values.year}-${values.month}-${values.day}T${values.hour}:00`;
+  const slotHour = codexCatchUp
+    ? Math.max(-1, ...C.scheduleHours.filter((scheduledHour) => scheduledHour <= hour))
+    : C.scheduleHours.includes(hour) && minute < (C.scheduleWindowMinutes || 1) ? hour : -1;
+  if (slotHour < 0) return null;
+  return `${values.year}-${values.month}-${values.day}T${String(slotHour).padStart(2, "0")}:00`;
 }
 
 function getResetDriftMs(previousResetAt, nextResetAt) {
@@ -260,10 +263,10 @@ function shouldSkipAfterFailure(state, key, nowMs = Date.now()) {
   return failedAt && nowMs - failedAt < C.failureCooldownMs;
 }
 
-async function pingConnection(conn, provider, providerConfig, handler, deps, state = g) {
+async function pingConnection(conn, provider, providerConfig, handler, deps, state = g, codexCatchUp = false) {
   const key = cacheKey(provider, conn.id);
 
-  const scheduledSlot = getScheduledSlot(providerConfig);
+  const scheduledSlot = getScheduledSlot(providerConfig, Date.now(), codexCatchUp);
   if (providerConfig.schedule) {
     if (!scheduledSlot || conn.lastAutoPingSlot === scheduledSlot || state.scheduleCache?.[key] === scheduledSlot) return;
   } else {
@@ -340,7 +343,7 @@ function createDefaultDeps() {
   };
 }
 
-export async function runQuotaAutoPingTick(deps = createDefaultDeps(), state = g) {
+export async function runQuotaAutoPingTick(deps = createDefaultDeps(), state = g, { codexCatchUp = false } = {}) {
   const summary = { attempted: 0, sent: 0, skipped: 0, failed: 0, retries: 0 };
   if (state.running) return { ...summary, busy: true };
   state.running = true;
@@ -348,6 +351,7 @@ export async function runQuotaAutoPingTick(deps = createDefaultDeps(), state = g
     const settings = await deps.getSettings();
 
     for (const [provider, providerConfig] of Object.entries(C.providers)) {
+      if (codexCatchUp && provider !== "codex") continue;
       const handler = providerHandlers[provider];
       if (!handler) continue;
 
@@ -362,7 +366,7 @@ export async function runQuotaAutoPingTick(deps = createDefaultDeps(), state = g
       for (const conn of targets) {
         summary.attempted += 1;
         try {
-          const result = await pingConnection(conn, provider, providerConfig, handler, deps, state);
+          const result = await pingConnection(conn, provider, providerConfig, handler, deps, state, codexCatchUp);
           summary.retries += result?.retries || 0;
           if (result?.sent) summary.sent += 1;
           else summary.skipped += 1;

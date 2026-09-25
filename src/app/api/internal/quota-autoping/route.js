@@ -27,7 +27,8 @@ export async function POST(request) {
 
   const startedAt = new Date().toISOString();
   try {
-    const summary = await runQuotaAutoPingTick();
+    const codexCatchUp = new URL(request.url).searchParams.get("catchUp") === "codex";
+    const summary = await runQuotaAutoPingTick(undefined, undefined, { codexCatchUp });
     const finishedAt = new Date().toISOString();
     if (summary?.busy) {
       console.warn("[AutoPing] Function trigger skipped because another tick is running");
@@ -36,6 +37,9 @@ export async function POST(request) {
     if (summary?.failed > 0) {
       console.error(`[AutoPing] ${summary.failed} account(s) failed`);
       return NextResponse.json({ ok: false, error: "Auto-ping failed", summary }, { status: 502 });
+    }
+    if (codexCatchUp && summary?.sent === 0) {
+      return NextResponse.json({ ok: false, error: "No Codex ping sent", summary }, { status: 409 });
     }
     console.log(`[AutoPing] Function trigger completed at ${finishedAt}`);
     return NextResponse.json({ ok: true, startedAt, finishedAt, summary });

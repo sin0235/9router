@@ -197,6 +197,28 @@ describe("quota auto-ping", () => {
     expect(deps.updateProviderConnection).toHaveBeenCalledTimes(1);
   });
 
+  it("catches up the latest Codex slot after its five-minute window", async () => {
+    vi.setSystemTime(new Date("2026-01-02T05:16:00.000Z")); // 12:16 in Vietnam, after the 11:00 slot
+    deps.getSettings.mockResolvedValue({});
+    deps.getProviderConnections.mockImplementation(async ({ provider }) => (
+      provider === "codex"
+        ? [{ id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token" }]
+        : []
+    ));
+    getCodexUsage.mockResolvedValue({ plan: "Plus", quotas: { session: { used: 1, total: 100, remaining: 99 } } });
+
+    const first = await runQuotaAutoPingTick(deps, state, { codexCatchUp: true });
+    const second = await runQuotaAutoPingTick(deps, state, { codexCatchUp: true });
+
+    expect(first).toMatchObject({ attempted: 1, sent: 1, failed: 0 });
+    expect(second).toMatchObject({ attempted: 1, sent: 0, skipped: 1 });
+    expect(deps.updateProviderConnection).toHaveBeenCalledWith("codex-1", expect.objectContaining({
+      lastAutoPingSlot: "2026-01-02T11:00",
+    }));
+    expect(deps.getExecutor).toHaveBeenCalledOnce();
+    expect(getClaudeUsage).not.toHaveBeenCalled();
+  });
+
   it("allows an explicit false setting to disable one Codex connection", async () => {
     vi.setSystemTime(new Date("2026-01-01T23:02:00.000Z"));
     deps.getSettings.mockResolvedValue({ codexAutoPing: { connections: { "codex-1": false } } });

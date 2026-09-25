@@ -42,6 +42,19 @@ describe("quota auto-ping trigger route", () => {
     expect(runQuotaAutoPingTick).toHaveBeenCalledOnce();
   });
 
+  it("runs a requested Codex catch-up tick and reports when nothing was sent", async () => {
+    runQuotaAutoPingTick.mockResolvedValueOnce({ attempted: 1, sent: 0, skipped: 1, failed: 0 });
+
+    const response = await POST(new Request("http://localhost/api/internal/quota-autoping?catchUp=codex", {
+      method: "POST",
+      headers: { authorization: "Bearer test-secret" },
+    }));
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ ok: false, summary: { sent: 0 } });
+    expect(runQuotaAutoPingTick).toHaveBeenCalledWith(undefined, undefined, { codexCatchUp: true });
+  });
+
   it("fails closed when the shared secret is not configured", async () => {
     delete process.env.QUOTA_AUTOPING_SECRET;
 
