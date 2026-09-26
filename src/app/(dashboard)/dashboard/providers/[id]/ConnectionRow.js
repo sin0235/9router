@@ -24,7 +24,7 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
         ? `Legacy: ${connection.providerSpecificData?.connectionProxyUrl}`
         : "";
   const autoPingTooltip = autoPing?.provider === "codex"
-    ? "Sends a tiny gpt-5.6-luna request daily at 06:00, 11:00, 16:00, and 21:00 Vietnam time with low reasoning."
+    ? "Sends a tiny gpt-6-luna request daily at 06:00, 11:00, 16:00, and 21:00 Vietnam time with low reasoning."
     : "When your 5h quota runs out, auto-sends a request the moment it resets so a new window starts right away.";
 
   let maskedProxyUrl = "";

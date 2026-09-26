@@ -38,7 +38,7 @@ vi.mock("@/shared/constants/config", () => ({
       codex: {
         settingsKey: "codexAutoPing",
         quotaKey: "session",
-        pingModel: "gpt-5.6-luna",
+        pingModel: "gpt-6-luna",
         pingText: "hi",
         pingInstructions: "Reply with OK.",
         pingReasoningEffort: "low",
@@ -120,9 +120,9 @@ describe("quota auto-ping", () => {
 
     expect(deps.getExecutor).toHaveBeenCalledTimes(2);
     expect(deps.getExecutor.mock.results[0].value.execute).toHaveBeenCalledWith(expect.objectContaining({
-      model: "gpt-5.6-luna",
+      model: "gpt-6-luna",
       body: expect.objectContaining({
-        model: "gpt-5.6-luna",
+        model: "gpt-6-luna",
         reasoning: { effort: "low", summary: "auto" },
       }),
     }));

@@ -87,7 +87,7 @@ export const QUOTA_AUTOPING_CONFIG = {
       minPingIntervalMs: 600000,
       skipWhenBlockingQuotaExhausted: true,
       schedule: true,
-      pingModel: "gpt-5.6-luna",
+      pingModel: "gpt-6-luna",
       pingText: "hi",
       pingInstructions: "Reply with OK.",
       pingReasoningEffort: "low",
