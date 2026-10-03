@@ -26,7 +26,6 @@ vi.mock("@/shared/constants/config", () => ({
     retryDelayMs: 0,
     scheduleTimezone: "Asia/Ho_Chi_Minh",
     scheduleHours: [6, 11, 16, 21],
-    scheduleWindowMinutes: 30,
     accountTimeoutMs: 25000,
     providers: {
       claude: {
@@ -416,5 +415,47 @@ describe("quota auto-ping", () => {
     expect(await runQuotaAutoPingTick(deps, state)).toMatchObject({ sent: 1, verified: 0, pending: 1 });
     expect(conn.lastAutoPingSlot).toBeUndefined();
     expect(deps.getExecutor).toHaveBeenCalledTimes(2);
+  });
+
+  it("continues the 11h recovery after an exhausted account resets at 14:18", async () => {
+    vi.setSystemTime(new Date("2026-01-01T04:00:00Z"));
+    onePlusConnection();
+    const resetAt = "2026-01-01T07:18:00Z";
+    getCodexUsage.mockResolvedValue({ plan: "Plus", quotas: { session: { used: 100, remaining: 0, resetAt } } });
+    expect(await runQuotaAutoPingTick(deps, state)).toMatchObject({ sent: 0, pending: 1 });
+    vi.setSystemTime(new Date("2026-01-01T07:20:00Z"));
+    getCodexUsage.mockImplementation(async (token) => activated.has(token) ? codexUsage(true) : {
+      plan: "Plus", quotas: { session: { used: 100, remaining: 0, resetAt } },
+    });
+    const recovered = await runQuotaAutoPingTick(deps, state);
+    expect(recovered).toMatchObject({ sent: 1, verified: 1, pending: 0 });
+    expect(recovered.accounts[0].slot).toBe("2026-01-01T11:00");
+  });
+
+  it("recovers the previous day's 21h slot after midnight and stops calls after confirmation", async () => {
+    vi.setSystemTime(new Date("2026-01-01T17:25:00Z")); // 00:25 on Jan 2 in Vietnam
+    const conn = onePlusConnection();
+    const first = await runQuotaAutoPingTick(deps, state);
+    expect(first).toMatchObject({ sent: 1, verified: 1 });
+    expect(conn.lastAutoPingSlot).toBe("2026-01-01T21:00");
+    expect(conn.lastAutoPingVerifiedAt).toBeTruthy();
+    getCodexUsage.mockClear();
+    deps.getExecutor.mockClear();
+    const second = await runQuotaAutoPingTick(deps, state);
+    expect(second).toMatchObject({ sent: 0, verified: 1, pending: 0 });
+    expect(getCodexUsage).not.toHaveBeenCalled();
+    expect(deps.getExecutor).not.toHaveBeenCalled();
+  });
+
+  it("waits for the old fixed window even when its usage rounds to zero", async () => {
+    vi.setSystemTime(new Date("2026-01-02T04:00:00Z"));
+    onePlusConnection({ lastPingAt: "2026-01-01T23:01:00Z" });
+    getCodexUsage.mockResolvedValue({ plan: "Plus", quotas: { session: {
+      used: 0, remaining: 100, resetAt: "2026-01-02T04:01:00Z",
+    } } });
+    const summary = await runQuotaAutoPingTick(deps, state);
+    expect(summary).toMatchObject({ sent: 0, verified: 0, pending: 1 });
+    expect(summary.accounts[0].reason).toBe("waiting-for-session-reset");
+    expect(deps.getExecutor).not.toHaveBeenCalled();
   });
 });

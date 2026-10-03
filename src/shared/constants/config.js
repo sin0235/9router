@@ -72,7 +72,6 @@ export const QUOTA_AUTOPING_CONFIG = {
   retryDelayMs: 1000,
   scheduleTimezone: "Asia/Ho_Chi_Minh",
   scheduleHours: [6, 11, 16, 21],
-  scheduleWindowMinutes: 30,            // recover when the previous 5h window expires after the hour
   accountTimeoutMs: 25000,
   providers: {
     claude: {

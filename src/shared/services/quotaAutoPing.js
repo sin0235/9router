@@ -45,9 +45,9 @@ function normalizeResetKey(resetAt) {
   return new Date(Math.floor(ms / 60000) * 60000).toISOString();
 }
 
-function getScheduledSlot(providerConfig, nowMs = Date.now(), codexCatchUp = false) {
+function getScheduledSlot(providerConfig, nowMs = Date.now()) {
   if (!providerConfig.schedule) return null;
-  const parts = new Intl.DateTimeFormat("en-US", {
+  const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone: C.scheduleTimezone,
     year: "numeric",
     month: "2-digit",
@@ -56,17 +56,21 @@ function getScheduledSlot(providerConfig, nowMs = Date.now(), codexCatchUp = fal
     minute: "2-digit",
     second: "2-digit",
     hourCycle: "h23",
-  }).formatToParts(new Date(nowMs));
+  });
+  const parts = formatter.formatToParts(new Date(nowMs));
   const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
   const hour = Number(values.hour);
   const minute = Number(values.minute);
-  const slotHour = codexCatchUp
-    ? Math.max(-1, ...C.scheduleHours.filter((scheduledHour) => scheduledHour <= hour))
-    : C.scheduleHours.includes(hour) && minute < (C.scheduleWindowMinutes || 1) ? hour : -1;
-  if (slotHour < 0) return null;
+  let slotHour = Math.max(-1, ...C.scheduleHours.filter((scheduledHour) => scheduledHour <= hour));
+  const previousDay = slotHour < 0;
+  if (previousDay) slotHour = Math.max(...C.scheduleHours);
+  const startsAt = nowMs - ((hour - slotHour + (previousDay ? 24 : 0)) * 3600 + minute * 60 + Number(values.second)) * 1000 - nowMs % 1000;
+  const slotDate = previousDay
+    ? Object.fromEntries(formatter.formatToParts(new Date(startsAt)).map(({ type, value }) => [type, value]))
+    : values;
   return {
-    id: `${values.year}-${values.month}-${values.day}T${String(slotHour).padStart(2, "0")}:00`,
-    startsAt: nowMs - ((hour - slotHour) * 3600 + minute * 60 + Number(values.second)) * 1000 - nowMs % 1000,
+    id: `${slotDate.year}-${slotDate.month}-${slotDate.day}T${String(slotHour).padStart(2, "0")}:00`,
+    startsAt,
   };
 }
 
@@ -118,16 +122,20 @@ function hasExhaustedBlockingQuota(quotas, sessionKey, provider) {
 function isCodexSlotActive(quota, slot, providerConfig, connection) {
   // A successful HTTP response can still belong to the previous 5h window.
   const resetMs = new Date(quota?.resetAt).getTime();
-  if (!(resetMs >= slot.startsAt + providerConfig.sessionWindowMs)) return false;
+  if (!(resetMs >= slot.startsAt + providerConfig.sessionWindowMs && resetMs > Date.now())) return false;
   if (toFiniteNumber(quota?.used, 0) > 0) return true;
+  return isCodexResetFixed(quota, providerConfig, connection);
+}
 
+function isCodexResetFixed(quota, providerConfig, connection) {
   // Tiny requests may round to 0%. An idle window slides to now + 5h;
   // a real window keeps a deadline anchored before a completed ping.
   // Wait two ticks so an idle window cannot pass the one-tick clock tolerance.
   const pingMs = new Date(connection?.lastPingAt).getTime();
   return Number.isFinite(pingMs)
+    && new Date(quota?.resetAt).getTime() > Date.now()
     && Date.now() - pingMs >= 2 * C.tickIntervalMs
-    && resetMs <= pingMs + providerConfig.sessionWindowMs + C.tickIntervalMs;
+    && new Date(quota?.resetAt).getTime() <= pingMs + providerConfig.sessionWindowMs + C.tickIntervalMs;
 }
 
 function shouldPingForReset(providerConfig, cachedReset, resetAt, now) {
@@ -307,6 +315,12 @@ async function pingConnection(conn, provider, providerConfig, handler, deps, sta
 
   if (providerConfig.schedule) {
     if (!scheduledSlot) return skipped("outside-schedule");
+    // Only the new verified marker can suppress recovery; legacy sent markers cannot.
+    if (conn.lastAutoPingSlot === scheduledSlot.id
+      && new Date(conn.lastAutoPingVerifiedAt).getTime() >= scheduledSlot.startsAt
+      && new Date(conn.lastAutoPingVerifiedResetAt).getTime() >= scheduledSlot.startsAt + providerConfig.sessionWindowMs) {
+      return { status: "verified", verified: true, reason: "slot-verified", resetAt: conn.lastAutoPingVerifiedResetAt };
+    }
   } else {
     // resetAt is stable for time-based windows; Codex uses the fixed schedule above.
     const cachedReset = state.resetCache[key];
@@ -343,14 +357,16 @@ async function pingConnection(conn, provider, providerConfig, handler, deps, sta
     if (!quota) throw new Error("Codex usage did not include the session quota");
     if (isCodexSlotActive(quota, scheduledSlot, providerConfig, connection)) {
       signal.throwIfAborted();
-      if (connection.lastAutoPingSlot !== scheduledSlot.id) {
-        await deps.updateProviderConnection(connection.id, { lastAutoPingSlot: scheduledSlot.id });
-      }
+      await deps.updateProviderConnection(connection.id, {
+        lastAutoPingSlot: scheduledSlot.id,
+        lastAutoPingVerifiedAt: new Date().toISOString(),
+        lastAutoPingVerifiedResetAt: quota.resetAt,
+      });
       return { status: "verified", verified: true, reason: toFiniteNumber(quota.used, 0) > 0 ? "window-active" : "window-reset-fixed", resetAt: quota.resetAt, remaining: quota.remaining };
     }
     // A 06:01 activation expires at 11:01. A request at 11:00 cannot open the next window.
     if (new Date(quota.resetAt).getTime() > Date.now()
-      && (toFiniteNumber(quota.used, 0) > 0 || isQuotaExhausted(quota))) {
+      && (toFiniteNumber(quota.used, 0) > 0 || isQuotaExhausted(quota) || isCodexResetFixed(quota, providerConfig, connection))) {
       return pending("waiting-for-session-reset", quota);
     }
   } else if (quota && isQuotaExhausted(quota)) return skipped("session-exhausted");
@@ -395,6 +411,8 @@ async function pingConnection(conn, provider, providerConfig, handler, deps, sta
       return { ...pending("quota-not-activated", checkedQuota), sent: true, retries: usageRetries + pingRetries + checked.retries };
     }
     pingState.lastAutoPingSlot = scheduledSlot.id;
+    pingState.lastAutoPingVerifiedAt = new Date().toISOString();
+    pingState.lastAutoPingVerifiedResetAt = verification.resetAt;
   } else {
     pingState.lastPingedResetAt = resetAt;
     pingState.lastPingedResetKey = resetKey;
@@ -436,7 +454,7 @@ export async function runQuotaAutoPingTick(deps = createDefaultDeps(), state = g
       const targets = conns.filter((conn) => conn.authType === "oauth" && (
         provider === "codex" ? enabledMap[conn.id] !== false : enabledMap[conn.id] === true
       ));
-      const scheduledSlot = getScheduledSlot(providerConfig, Date.now(), codexCatchUp);
+      const scheduledSlot = getScheduledSlot(providerConfig, Date.now());
       await Promise.all(targets.map(async (conn) => {
         summary.attempted += 1;
         const controller = new AbortController();
