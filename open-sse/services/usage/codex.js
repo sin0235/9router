@@ -104,13 +104,16 @@ function getCodexSparkRateLimit(data) {
   }) || null;
 }
 
-export async function getCodexUsage(accessToken, proxyOptions = null) {
+export async function getCodexUsage(accessToken, proxyOptions = null, providerSpecificData = null, signal = undefined) {
   try {
+    const accountId = getCodexAccountId(providerSpecificData);
     const response = await proxyAwareFetch(CODEX_CONFIG.usageUrl, {
       method: "GET",
+      signal,
       headers: {
         "Authorization": `Bearer ${accessToken}`,
         "Accept": "application/json",
+        ...(accountId ? { "ChatGPT-Account-ID": accountId } : {}),
       },
     }, proxyOptions);
 

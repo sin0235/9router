@@ -28,7 +28,12 @@ export async function handleQuotaAutoPing({ req, res, log = () => {}, error = ()
     || (req?.bodyText?.trim() && req.bodyJson?.catchUp === "codex");
   const endpoint = `${config.targetUrl}/api/internal/quota-autoping${codexCatchUp ? "?catchUp=codex" : ""}`;
   let lastError;
+  let lastSummary;
+  let attempts = 0;
+  const deadline = Date.now() + 55000;
   for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt += 1) {
+    if (Date.now() >= deadline) break;
+    attempts = attempt;
     try {
       const response = await fetch(endpoint, {
         method: "POST",
@@ -36,18 +41,22 @@ export async function handleQuotaAutoPing({ req, res, log = () => {}, error = ()
           "x-quota-autoping-secret": config.secret,
           accept: "application/json",
         },
-        signal: AbortSignal.timeout(55000),
+        signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
       });
       let payload = null;
       try { payload = await response.json(); } catch { /* empty response */ }
+      lastSummary = payload?.summary;
 
       if (response.ok && payload?.ok === true) {
         const sent = Number.isInteger(payload?.summary?.sent) ? payload.summary.sent : null;
-        log(`Site auto-ping trigger completed with HTTP ${response.status}; ${sent ?? "unknown"} ping(s) sent (attempt ${attempt})`);
-        return res.json({ ok: true, status: response.status, attempts: attempt, sent }, 200);
+        log(`Site auto-ping HTTP ${response.status}: ${sent ?? "unknown"} sent, ${lastSummary?.verified ?? "unknown"} verified, ${lastSummary?.pending ?? 0} pending (attempt ${attempt})`);
+        if (lastSummary?.accounts) log(JSON.stringify(lastSummary.accounts));
+        return res.json({ ok: true, status: response.status, attempts: attempt, sent, summary: lastSummary }, 200);
       }
 
       lastError = new Error(payload?.error || `Site returned HTTP ${response.status}`);
+      // Account failures need the next recovery run; an immediate retry can hide them behind cooldown skips.
+      if (lastSummary?.failed > 0) break;
     } catch (cause) {
       lastError = cause;
     }
@@ -55,8 +64,9 @@ export async function handleQuotaAutoPing({ req, res, log = () => {}, error = ()
     if (attempt < RETRY_ATTEMPTS) await sleep(RETRY_DELAY_MS);
   }
 
-  error(`Site trigger failed after ${RETRY_ATTEMPTS} attempts: ${lastError?.message || "unknown error"}`);
-  return res.json({ ok: false, error: "Site trigger failed" }, 502);
+  error(`Site trigger failed after ${attempts} attempts: ${lastError?.message || "unknown error"}`);
+  if (lastSummary?.accounts) error(JSON.stringify(lastSummary.accounts));
+  return res.json({ ok: false, error: "Site trigger failed", attempts, summary: lastSummary }, 502);
 }
 
 export default handleQuotaAutoPing;

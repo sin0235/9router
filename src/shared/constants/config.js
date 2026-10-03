@@ -72,7 +72,8 @@ export const QUOTA_AUTOPING_CONFIG = {
   retryDelayMs: 1000,
   scheduleTimezone: "Asia/Ho_Chi_Minh",
   scheduleHours: [6, 11, 16, 21],
-  scheduleWindowMinutes: 5,
+  scheduleWindowMinutes: 30,            // recover when the previous 5h window expires after the hour
+  accountTimeoutMs: 25000,
   providers: {
     claude: {
       settingsKey: "claudeAutoPing",    // preserve existing settings contract
@@ -84,7 +85,9 @@ export const QUOTA_AUTOPING_CONFIG = {
     codex: {
       settingsKey: "codexAutoPing",
       quotaKey: "session",
-      minPingIntervalMs: 600000,
+      minPingIntervalMs: 240000,        // allow the :05 retry even if :00 finished a few seconds late
+      failureCooldownMs: 240000,
+      sessionWindowMs: 5 * 60 * 60 * 1000,
       skipWhenBlockingQuotaExhausted: true,
       schedule: true,
       pingModel: "gpt-6-luna",

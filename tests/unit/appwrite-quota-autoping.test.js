@@ -114,4 +114,16 @@ describe("Appwrite quota auto-ping Function", () => {
     expect(result).toMatchObject({ status: 200 });
     expect(response.json).toHaveBeenCalledWith(expect.objectContaining({ ok: true, attempts: 2 }), 200);
   });
+
+  it("keeps each account outcome and does not turn an account failure into a cooldown success", async () => {
+    const summary = { attempted: 2, sent: 1, verified: 1, pending: 0, failed: 1, accounts: [
+      { connectionId: "healthy", status: "verified" }, { connectionId: "expired", status: "failed", reason: "401" },
+    ] };
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: false, summary }), { status: 502 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const response = { json: vi.fn((body, status = 200) => ({ body, status })) };
+    const result = await handleQuotaAutoPing({ res: response, error: vi.fn() });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ status: 502, body: { summary } });
+  });
 });

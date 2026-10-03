@@ -102,4 +102,21 @@ describe("quota auto-ping trigger route", () => {
     expect(response.status).toBe(503);
     expect(await response.json()).toMatchObject({ ok: false, summary: { busy: true } });
   });
+
+  it("reports pending quota activation separately from completed activation", async () => {
+    runQuotaAutoPingTick.mockResolvedValueOnce({ attempted: 2, sent: 1, verified: 1, pending: 1, failed: 0 });
+    const response = await POST(new Request("http://localhost/api/internal/quota-autoping", {
+      method: "POST", headers: { authorization: "Bearer test-secret" },
+    }));
+    expect(response.status).toBe(202);
+    expect(await response.json()).toMatchObject({ ok: true, summary: { verified: 1, pending: 1 } });
+  });
+
+  it("accepts a catch-up when quota is already verified without sending another ping", async () => {
+    runQuotaAutoPingTick.mockResolvedValueOnce({ attempted: 1, sent: 0, verified: 1, pending: 0, failed: 0 });
+    const response = await POST(new Request("http://localhost/api/internal/quota-autoping?catchUp=codex", {
+      method: "POST", headers: { authorization: "Bearer test-secret" },
+    }));
+    expect(response.status).toBe(200);
+  });
 });

@@ -10,6 +10,8 @@ import { proxyAwareFetch } from "open-sse/utils/proxyFetch.js";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { refreshAndUpdateCredentials } from "@/app/api/usage/[connectionId]/route.js";
 import { QUOTA_AUTOPING_CONFIG } from "@/shared/constants/config";
+import { parseSSELine } from "open-sse/utils/streamHelpers.js";
+import { isOpenAIResponsesTerminalEvent } from "open-sse/utils/responsesStreamHelpers.js";
 
 const C = QUOTA_AUTOPING_CONFIG;
 const CLAUDE_PING_URL = "https://api.anthropic.com/v1/messages?beta=true";
@@ -30,7 +32,6 @@ const g = (global.__quotaAutoPing ??= {
   interval: null,
   running: false,
   resetCache: {},
-  scheduleCache: {},
   failureCache: {},
 });
 
@@ -53,6 +54,7 @@ function getScheduledSlot(providerConfig, nowMs = Date.now(), codexCatchUp = fal
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+    second: "2-digit",
     hourCycle: "h23",
   }).formatToParts(new Date(nowMs));
   const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
@@ -62,7 +64,10 @@ function getScheduledSlot(providerConfig, nowMs = Date.now(), codexCatchUp = fal
     ? Math.max(-1, ...C.scheduleHours.filter((scheduledHour) => scheduledHour <= hour))
     : C.scheduleHours.includes(hour) && minute < (C.scheduleWindowMinutes || 1) ? hour : -1;
   if (slotHour < 0) return null;
-  return `${values.year}-${values.month}-${values.day}T${String(slotHour).padStart(2, "0")}:00`;
+  return {
+    id: `${values.year}-${values.month}-${values.day}T${String(slotHour).padStart(2, "0")}:00`,
+    startsAt: nowMs - ((hour - slotHour) * 3600 + minute * 60 + Number(values.second)) * 1000 - nowMs % 1000,
+  };
 }
 
 function getResetDriftMs(previousResetAt, nextResetAt) {
@@ -102,8 +107,19 @@ function isBlockingQuotaName(name, sessionKey) {
   return !String(name).toLowerCase().includes("session");
 }
 
-function hasExhaustedBlockingQuota(quotas, sessionKey) {
-  return Object.entries(quotas || {}).some(([name, quota]) => isBlockingQuotaName(name, sessionKey) && isQuotaExhausted(quota));
+function hasExhaustedBlockingQuota(quotas, sessionKey, provider) {
+  return Object.entries(quotas || {}).some(([name, quota]) => (
+    (provider === "codex" ? name === "weekly" : isBlockingQuotaName(name, sessionKey))
+    && isQuotaExhausted(quota)
+    && !(new Date(quota.resetAt).getTime() <= Date.now())
+  ));
+}
+
+function isCodexSlotActive(quota, slot, providerConfig) {
+  // A successful HTTP response can still belong to the previous 5h window.
+  // Zero usage alone does not prove activation, even with a future reset time.
+  return toFiniteNumber(quota?.used, 0) > 0
+    && new Date(quota?.resetAt).getTime() >= slot.startsAt + providerConfig.sessionWindowMs;
 }
 
 function shouldPingForReset(providerConfig, cachedReset, resetAt, now) {
@@ -136,7 +152,7 @@ function isPlusCodexAccount(connection, usage) {
   return typeof livePlan === "string" && livePlan.toLowerCase().includes("plus");
 }
 
-async function getUsageWithRetry(connection, handler, proxyOptions, deps) {
+async function getUsageWithRetry(connection, handler, proxyOptions, deps, signal, provider) {
   let current = connection;
   let forceRefresh = false;
   let lastError;
@@ -144,15 +160,21 @@ async function getUsageWithRetry(connection, handler, proxyOptions, deps) {
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
+      signal?.throwIfAborted();
       const refreshed = await deps.refreshAndUpdateCredentials(current, forceRefresh, proxyOptions);
       current = refreshed?.connection || current;
-      const usage = await handler.getUsage(current.accessToken, proxyOptions);
+      signal?.throwIfAborted();
+      const usage = provider === "codex"
+        ? await handler.getUsage(current.accessToken, proxyOptions, current.providerSpecificData, signal)
+        : await handler.getUsage(current.accessToken, proxyOptions);
+      signal?.throwIfAborted();
       if (usage?.message) throw new Error(usage.message);
       if (!usage?.quotas || typeof usage.quotas !== "object") {
         throw new Error("Usage response did not include quota data");
       }
       return { connection: current, usage, retries: attempt };
     } catch (error) {
+      signal?.throwIfAborted();
       lastError = error;
       forceRefresh = /expired|auth|unauthorized|401|re-authorize/i.test(error.message || "");
       if (attempt + 1 < attempts) await sleep(C.retryDelayMs);
@@ -162,17 +184,20 @@ async function getUsageWithRetry(connection, handler, proxyOptions, deps) {
   throw lastError || new Error("Unable to fetch usage");
 }
 
-async function sendPingWithRetry(connection, providerConfig, proxyOptions, deps, handler) {
+async function sendPingWithRetry(connection, providerConfig, proxyOptions, deps, handler, signal) {
   let lastError;
   const attempts = Math.max(1, C.retryAttempts || 1);
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      if (await handler.sendPing(connection, providerConfig, proxyOptions, deps)) {
+      signal?.throwIfAborted();
+      if (await handler.sendPing(connection, providerConfig, proxyOptions, deps, signal)) {
+        signal?.throwIfAborted();
         return attempt;
       }
       lastError = new Error("Provider rejected auto-ping request");
     } catch (error) {
+      signal?.throwIfAborted();
       lastError = error;
     }
     if (attempt + 1 < attempts) await sleep(C.retryDelayMs);
@@ -181,9 +206,10 @@ async function sendPingWithRetry(connection, providerConfig, proxyOptions, deps,
   throw lastError || new Error("Auto-ping failed");
 }
 
-async function sendClaudePing(connection, providerConfig, proxyOptions, deps) {
+async function sendClaudePing(connection, providerConfig, proxyOptions, deps, signal) {
   const res = await deps.proxyAwareFetch(CLAUDE_PING_URL, {
     method: "POST",
+    signal,
     headers: {
       ...CLAUDE_CLI_SPOOF_HEADERS,
       "Authorization": `Bearer ${connection.accessToken}`,
@@ -206,30 +232,33 @@ function buildCodexPingInput(text) {
   }];
 }
 
-async function drainResponseBody(response) {
-  if (typeof response?.text === "function") {
-    await response.text();
-    return;
-  }
-
-  const reader = response?.body?.getReader?.();
-  if (!reader) return;
-
-  try {
-    while (true) {
-      const { done } = await reader.read();
-      if (done) return;
+async function verifyCodexResponse(response) {
+  const text = await response.text();
+  let completed = false;
+  let eventName = null;
+  for (const line of text.split(/\r?\n/)) {
+    if (!line) eventName = null;
+    else if (line.startsWith("event:")) eventName = line.slice(6).trim();
+    else if (line.startsWith("data:")) {
+      const chunk = parseSSELine(line);
+      if (!chunk || chunk.done) continue;
+      const type = eventName || chunk.type;
+      if (chunk.error || chunk.response?.error || type === "response.failed" || type === "response.incomplete" || type === "error"
+        || chunk.response?.status === "failed" || chunk.response?.status === "incomplete") {
+        throw new Error(chunk.error?.message || chunk.response?.error?.message || "Codex stream failed");
+      }
+      if (isOpenAIResponsesTerminalEvent(eventName, chunk)) completed = true;
     }
-  } finally {
-    reader.releaseLock?.();
   }
+  if (!completed) throw new Error("Codex stream closed without a completed response");
 }
 
-async function sendCodexPing(connection, providerConfig, proxyOptions, deps) {
+async function sendCodexPing(connection, providerConfig, proxyOptions, deps, signal) {
   const executor = deps.getExecutor("codex");
   const { response } = await executor.execute({
     model: providerConfig.pingModel,
     stream: true,
+    signal,
     credentials: {
       accessToken: connection.accessToken,
       connectionId: connection.id,
@@ -250,25 +279,26 @@ async function sendCodexPing(connection, providerConfig, proxyOptions, deps) {
   });
   if (!response.ok) {
     try { await response.body?.cancel?.(); } catch { /* noop */ }
-    return false;
+    throw new Error(`Codex ping rejected (HTTP ${response.status})`);
   }
 
   // Codex only starts the 5h window after the streaming response completes.
-  await drainResponseBody(response);
+  await verifyCodexResponse(response);
   return true;
 }
 
-function shouldSkipAfterFailure(state, key, nowMs = Date.now()) {
+function shouldSkipAfterFailure(state, key, providerConfig, nowMs = Date.now()) {
   const failedAt = state.failureCache[key];
-  return failedAt && nowMs - failedAt < C.failureCooldownMs;
+  return failedAt && nowMs - failedAt < (providerConfig.failureCooldownMs ?? C.failureCooldownMs);
 }
 
-async function pingConnection(conn, provider, providerConfig, handler, deps, state = g, codexCatchUp = false) {
+async function pingConnection(conn, provider, providerConfig, handler, deps, state, scheduledSlot, signal) {
   const key = cacheKey(provider, conn.id);
+  const skipped = (reason) => ({ status: "skipped", reason });
+  const pending = (reason, quota) => ({ status: "pending", reason, resetAt: quota?.resetAt, remaining: quota?.remaining });
 
-  const scheduledSlot = getScheduledSlot(providerConfig, Date.now(), codexCatchUp);
   if (providerConfig.schedule) {
-    if (!scheduledSlot || conn.lastAutoPingSlot === scheduledSlot || state.scheduleCache?.[key] === scheduledSlot) return;
+    if (!scheduledSlot) return skipped("outside-schedule");
   } else {
     // resetAt is stable for time-based windows; Codex uses the fixed schedule above.
     const cachedReset = state.resetCache[key];
@@ -276,7 +306,7 @@ async function pingConnection(conn, provider, providerConfig, handler, deps, sta
   }
 
   // Avoid hammering provider auth/quota endpoints if a ping failed recently.
-  if (shouldSkipAfterFailure(state, key)) return;
+  if (shouldSkipAfterFailure(state, key, providerConfig)) return pending("failure-cooldown");
 
   const proxyCfg = await deps.resolveConnectionProxyConfig(conn.providerSpecificData);
   const proxyOptions = buildProxyOptions(proxyCfg);
@@ -286,17 +316,36 @@ async function pingConnection(conn, provider, providerConfig, handler, deps, sta
     handler,
     proxyOptions,
     deps,
+    signal,
+    provider,
   );
   const quotas = usage?.quotas || {};
   const quota = quotas?.[providerConfig.quotaKey];
 
   if (provider === "codex" && !isPlusCodexAccount(connection, usage)) {
     console.log(`[AutoPing] ${provider}:${conn.id}: skipped non-Plus account`);
-    return;
+    return skipped("not-plus");
   }
 
-  if (providerConfig.skipWhenBlockingQuotaExhausted && hasExhaustedBlockingQuota(quotas, providerConfig.quotaKey)) return;
-  if (quota && isQuotaExhausted(quota)) return;
+  if (providerConfig.skipWhenBlockingQuotaExhausted && hasExhaustedBlockingQuota(quotas, providerConfig.quotaKey, provider)) {
+    return pending("weekly-exhausted", quota);
+  }
+
+  if (provider === "codex") {
+    if (!quota) throw new Error("Codex usage did not include the session quota");
+    if (isCodexSlotActive(quota, scheduledSlot, providerConfig)) {
+      signal.throwIfAborted();
+      if (connection.lastAutoPingSlot !== scheduledSlot.id) {
+        await deps.updateProviderConnection(connection.id, { lastAutoPingSlot: scheduledSlot.id });
+      }
+      return { status: "verified", verified: true, reason: "window-active", resetAt: quota.resetAt, remaining: quota.remaining };
+    }
+    // A 06:01 activation expires at 11:01. A request at 11:00 cannot open the next window.
+    if (new Date(quota.resetAt).getTime() > Date.now()
+      && (toFiniteNumber(quota.used, 0) > 0 || isQuotaExhausted(quota))) {
+      return pending("waiting-for-session-reset", quota);
+    }
+  } else if (quota && isQuotaExhausted(quota)) return skipped("session-exhausted");
 
   const now = Date.now();
   let resetAt;
@@ -311,24 +360,40 @@ async function pingConnection(conn, provider, providerConfig, handler, deps, sta
     if (!shouldPingForReset(providerConfig, cachedReset, resetAt, now)) return;
     if (lastPingedResetKey === resetKey) return;
   }
-  if (wasPingedRecently(connection, providerConfig.minPingIntervalMs, now)) return;
+  if (wasPingedRecently(connection, providerConfig.minPingIntervalMs, now)) return pending("ping-cooldown", quota);
 
-  const pingRetries = await sendPingWithRetry(connection, providerConfig, proxyOptions, deps, handler);
+  const pingRetries = await sendPingWithRetry(connection, providerConfig, proxyOptions, deps, handler, signal);
 
   delete state.failureCache[key];
   const pingState = {
     lastPingAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
-  if (scheduledSlot) pingState.lastAutoPingSlot = scheduledSlot;
-  else {
+  let verification;
+  if (provider === "codex") {
+    // Persist the attempt separately: only a real new quota window completes the slot.
+    signal.throwIfAborted();
+    await deps.updateProviderConnection(connection.id, pingState);
+    await sleep(C.retryDelayMs);
+    const checked = await getUsageWithRetry(connection, handler, proxyOptions, deps, signal, provider);
+    const checkedQuota = checked.usage.quotas[providerConfig.quotaKey];
+    verification = {
+      verified: isCodexSlotActive(checkedQuota, scheduledSlot, providerConfig),
+      resetAt: checkedQuota?.resetAt,
+      remaining: checkedQuota?.remaining,
+      retries: checked.retries,
+    };
+    if (!verification.verified) {
+      return { ...pending("quota-not-activated", checkedQuota), sent: true, retries: usageRetries + pingRetries + checked.retries };
+    }
+    pingState.lastAutoPingSlot = scheduledSlot.id;
+  } else {
     pingState.lastPingedResetAt = resetAt;
     pingState.lastPingedResetKey = resetKey;
   }
+  signal.throwIfAborted();
   await deps.updateProviderConnection(connection.id, pingState);
-  if (scheduledSlot) state.scheduleCache[key] = scheduledSlot;
-  console.log(`[AutoPing] ${provider}:${connection.id}: ping sent${scheduledSlot ? ` (${scheduledSlot})` : ` (reset ${resetAt})`}`);
-  return { sent: true, retries: usageRetries + pingRetries };
+  return { status: "sent", sent: true, ...verification, retries: usageRetries + pingRetries + (verification?.retries || 0) };
 }
 
 function createDefaultDeps() {
@@ -344,7 +409,7 @@ function createDefaultDeps() {
 }
 
 export async function runQuotaAutoPingTick(deps = createDefaultDeps(), state = g, { codexCatchUp = false } = {}) {
-  const summary = { attempted: 0, sent: 0, skipped: 0, failed: 0, retries: 0 };
+  const summary = { attempted: 0, sent: 0, verified: 0, pending: 0, skipped: 0, failed: 0, retries: 0, accounts: [] };
   if (state.running) return { ...summary, busy: true };
   state.running = true;
   try {
@@ -363,19 +428,36 @@ export async function runQuotaAutoPingTick(deps = createDefaultDeps(), state = g
       const targets = conns.filter((conn) => conn.authType === "oauth" && (
         provider === "codex" ? enabledMap[conn.id] !== false : enabledMap[conn.id] === true
       ));
-      for (const conn of targets) {
+      const scheduledSlot = getScheduledSlot(providerConfig, Date.now(), codexCatchUp);
+      await Promise.all(targets.map(async (conn) => {
         summary.attempted += 1;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(new Error("Auto-ping account timed out")), C.accountTimeoutMs);
         try {
-          const result = await pingConnection(conn, provider, providerConfig, handler, deps, state, codexCatchUp);
+          const aborted = new Promise((_, reject) => {
+            controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true });
+          });
+          const result = await Promise.race([
+            pingConnection(conn, provider, providerConfig, handler, deps, state, scheduledSlot, controller.signal),
+            aborted,
+          ]);
           summary.retries += result?.retries || 0;
           if (result?.sent) summary.sent += 1;
-          else summary.skipped += 1;
+          if (result?.verified) summary.verified += 1;
+          if (result?.status === "pending") summary.pending += 1;
+          else if (!result?.sent) summary.skipped += 1;
+          const account = { provider, connectionId: conn.id, name: conn.name || conn.email, slot: scheduledSlot?.id, ...result, status: result?.status || "skipped" };
+          summary.accounts.push(account);
+          console.log(`[AutoPing] ${JSON.stringify(account)}`);
         } catch (e) {
           summary.failed += 1;
           state.failureCache[cacheKey(provider, conn.id)] = Date.now();
+          summary.accounts.push({ provider, connectionId: conn.id, name: conn.name || conn.email, slot: scheduledSlot?.id, status: "failed", reason: e.message });
           console.warn(`[AutoPing] ${provider}:${conn.id}: ${e.message}`);
+        } finally {
+          clearTimeout(timeout);
         }
-      }
+      }));
     }
   } catch (e) {
     summary.failed += 1;
@@ -387,6 +469,8 @@ export async function runQuotaAutoPingTick(deps = createDefaultDeps(), state = g
 }
 
 export function startQuotaAutoPing() {
+  // Appwrite cron owns retries; an SSR process timer cannot survive request termination.
+  if (process.env.QUOTA_AUTOPING_EXTERNAL_SCHEDULER === "true") return;
   if (g.interval) return;
   console.log("[AutoPing] scheduler started");
   runQuotaAutoPingTick().catch(() => {});
@@ -402,6 +486,10 @@ export function stopQuotaAutoPing() {
 }
 
 export function configureQuotaAutoPing(settings) {
+  if (process.env.QUOTA_AUTOPING_EXTERNAL_SCHEDULER === "true") {
+    stopQuotaAutoPing();
+    return;
+  }
   const enabled = settings?.codexAutoPing?.enabled !== false
     || Object.values(settings?.claudeAutoPing?.connections || {}).some(Boolean);
   if (enabled) startQuotaAutoPing();

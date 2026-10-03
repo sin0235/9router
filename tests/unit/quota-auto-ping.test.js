@@ -26,7 +26,8 @@ vi.mock("@/shared/constants/config", () => ({
     retryDelayMs: 0,
     scheduleTimezone: "Asia/Ho_Chi_Minh",
     scheduleHours: [6, 11, 16, 21],
-    scheduleWindowMinutes: 5,
+    scheduleWindowMinutes: 30,
+    accountTimeoutMs: 25000,
     providers: {
       claude: {
         settingsKey: "claudeAutoPing",
@@ -43,6 +44,9 @@ vi.mock("@/shared/constants/config", () => ({
         pingInstructions: "Reply with OK.",
         pingReasoningEffort: "low",
         schedule: true,
+        sessionWindowMs: 5 * 60 * 60 * 1000,
+        minPingIntervalMs: 240000,
+        failureCooldownMs: 240000,
         skipWhenBlockingQuotaExhausted: true,
       },
     },
@@ -76,6 +80,13 @@ describe("quota auto-ping", () => {
   let state;
   let getCodexUsage;
   let getClaudeUsage;
+  let activated;
+
+  const codexUsage = (active = false) => ({
+    plan: "Plus", quotas: { session: { used: active ? 1 : 0, total: 100, remaining: active ? 99 : 100,
+      resetAt: new Date(Date.now() + (active ? 5 * 3600000 : -60000)).toISOString() } },
+  });
+  const completedResponse = () => ({ response: new Response('event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n') });
 
   beforeEach(async () => {
     vi.resetModules();
@@ -87,6 +98,9 @@ describe("quota auto-ping", () => {
     ({ getClaudeUsage } = await import("open-sse/services/usage/claude.js"));
     ({ runQuotaAutoPingTick, configureQuotaAutoPing } = await import("../../src/shared/services/quotaAutoPing.js"));
 
+    activated = new Set();
+    getCodexUsage.mockImplementation(async (token) => codexUsage(activated.has(token)));
+
     deps = {
       getSettings: vi.fn(),
       getProviderConnections: vi.fn(),
@@ -95,7 +109,7 @@ describe("quota auto-ping", () => {
       refreshAndUpdateCredentials: vi.fn(async (connection) => ({ connection, refreshed: false })),
       proxyAwareFetch: vi.fn().mockResolvedValue({ ok: true }),
       getExecutor: vi.fn(() => ({
-        execute: vi.fn().mockResolvedValue({ response: { ok: true, text: vi.fn().mockResolvedValue("") } }),
+        execute: vi.fn(async ({ credentials }) => { activated.add(credentials.accessToken); return completedResponse(); }),
       })),
     };
     state = { running: false, resetCache: {}, scheduleCache: {}, failureCache: {} };
@@ -114,7 +128,6 @@ describe("quota auto-ping", () => {
         ]
         : []
     ));
-    getCodexUsage.mockResolvedValue({ plan: "Plus", quotas: { session: { used: 1, total: 100, remaining: 99 } } });
 
     await runQuotaAutoPingTick(deps, state);
 
@@ -126,7 +139,7 @@ describe("quota auto-ping", () => {
         reasoning: { effort: "low", summary: "auto" },
       }),
     }));
-    expect(deps.updateProviderConnection).toHaveBeenCalledTimes(2);
+    expect(deps.updateProviderConnection).toHaveBeenCalledTimes(4);
     expect(deps.updateProviderConnection).toHaveBeenCalledWith("codex-1", expect.objectContaining({
       lastAutoPingSlot: expect.stringContaining("T"),
     }));
@@ -155,15 +168,15 @@ describe("quota auto-ping", () => {
     ]);
     getCodexUsage
       .mockResolvedValueOnce({ message: "token expired" })
-      .mockResolvedValueOnce({ plan: "Plus", quotas: { session: { remaining: 99, total: 100 } } });
+      .mockResolvedValueOnce(codexUsage());
     const execute = vi.fn()
       .mockResolvedValueOnce({ response: { ok: false, body: { cancel: vi.fn() } } })
-      .mockResolvedValueOnce({ response: { ok: true, text: vi.fn().mockResolvedValue("") } });
+      .mockImplementationOnce(async ({ credentials }) => { activated.add(credentials.accessToken); return completedResponse(); });
     deps.getExecutor.mockReturnValue({ execute });
 
     const summary = await runQuotaAutoPingTick(deps, state);
 
-    expect(getCodexUsage).toHaveBeenCalledTimes(2);
+    expect(getCodexUsage).toHaveBeenCalledTimes(3);
     expect(execute).toHaveBeenCalledTimes(2);
     expect(summary).toMatchObject({ attempted: 1, sent: 1, failed: 0, retries: 2 });
   });
@@ -188,13 +201,12 @@ describe("quota auto-ping", () => {
     deps.getProviderConnections.mockResolvedValue([
       { id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token" },
     ]);
-    getCodexUsage.mockResolvedValue({ plan: "Plus", quotas: { session: { remaining: 99, total: 100 } } });
 
     await runQuotaAutoPingTick(deps, state);
     await runQuotaAutoPingTick(deps, state);
 
     expect(deps.getExecutor).toHaveBeenCalledTimes(1);
-    expect(deps.updateProviderConnection).toHaveBeenCalledTimes(1);
+    expect(deps.updateProviderConnection).toHaveBeenCalledTimes(3);
   });
 
   it("catches up the latest Codex slot after its five-minute window", async () => {
@@ -205,7 +217,6 @@ describe("quota auto-ping", () => {
         ? [{ id: "codex-1", provider: "codex", authType: "oauth", accessToken: "token" }]
         : []
     ));
-    getCodexUsage.mockResolvedValue({ plan: "Plus", quotas: { session: { used: 1, total: 100, remaining: 99 } } });
 
     const first = await runQuotaAutoPingTick(deps, state, { codexCatchUp: true });
     const second = await runQuotaAutoPingTick(deps, state, { codexCatchUp: true });
@@ -259,5 +270,120 @@ describe("quota auto-ping", () => {
       max_tokens: 1,
       messages: [{ role: "user", content: "hi" }],
     });
+  });
+
+  function onePlusConnection(extra = {}) {
+    const conn = { id: "plus", provider: "codex", authType: "oauth", accessToken: "token", ...extra };
+    deps.getSettings.mockResolvedValue({});
+    deps.getProviderConnections.mockImplementation(async ({ provider }) => provider === "codex" ? [conn] : []);
+    deps.updateProviderConnection.mockImplementation(async (_, patch) => Object.assign(conn, patch));
+    return conn;
+  }
+
+  it.each([6, 11, 16, 21])("verifies and retries full quota at %s:05 despite the old completed marker", async (hour) => {
+    const utcHour = (hour + 24 - 7) % 24;
+    const started = Date.UTC(2026, 0, 1, utcHour);
+    vi.setSystemTime(started);
+    const conn = onePlusConnection();
+    getCodexUsage.mockImplementation(async () => codexUsage());
+
+    const first = await runQuotaAutoPingTick(deps, state);
+    expect(first).toMatchObject({ sent: 1, verified: 0, pending: 1 });
+    expect(conn.lastAutoPingSlot).toBeUndefined();
+
+    // A marker written by the old implementation must not suppress verification/recovery.
+    conn.lastAutoPingSlot = `${hour === 6 ? "2026-01-02" : "2026-01-01"}T${String(hour).padStart(2, "0")}:00`;
+    vi.setSystemTime(started + 5 * 60000);
+    getCodexUsage.mockImplementation(async (token) => codexUsage(activated.has(token)));
+    activated.clear();
+    const recovery = await runQuotaAutoPingTick(deps, state);
+    expect(recovery).toMatchObject({ sent: 1, verified: 1, pending: 0 });
+    expect(deps.getExecutor).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([11, 16, 21])("waits for the previous window to expire and activates the %sh slot", async (hour) => {
+    const start = Date.UTC(2026, 0, 1, hour - 7, 0);
+    vi.setSystemTime(start);
+    onePlusConnection();
+    const oldUsage = { plan: "Plus", quotas: { session: {
+      used: 1, remaining: 99, resetAt: new Date(start + 60000).toISOString(),
+    } } };
+    getCodexUsage.mockResolvedValue(oldUsage);
+    expect(await runQuotaAutoPingTick(deps, state)).toMatchObject({ sent: 0, verified: 0, pending: 1 });
+    expect(deps.getExecutor).not.toHaveBeenCalled();
+
+    vi.setSystemTime(start + 5 * 60000);
+    getCodexUsage.mockImplementation(async (token) => activated.has(token) ? codexUsage(true) : oldUsage);
+    expect(await runQuotaAutoPingTick(deps, state)).toMatchObject({ sent: 1, verified: 1, pending: 0 });
+  });
+
+  it("does not mistake HTTP 200 with an SSE error for a completed ping", async () => {
+    vi.setSystemTime(new Date("2026-01-01T04:00:00Z"));
+    const conn = onePlusConnection();
+    deps.getExecutor.mockReturnValue({ execute: vi.fn(async () => ({
+      response: new Response('data: {"type":"response.failed","response":{"status":"failed","error":{"message":"quota denied"}}}\n\n'),
+    })) });
+    const summary = await runQuotaAutoPingTick(deps, state);
+    expect(summary).toMatchObject({ sent: 0, verified: 0, failed: 1 });
+    expect(summary.accounts[0].reason).toBe("quota denied");
+    expect(conn.lastAutoPingSlot).toBeUndefined();
+  });
+
+  it("does not accept an empty or truncated stream", async () => {
+    vi.setSystemTime(new Date("2026-01-01T04:00:00Z"));
+    onePlusConnection();
+    deps.getExecutor.mockReturnValue({ execute: vi.fn(async () => ({ response: new Response('data: {"type":"response.created"}\n\n') })) });
+    expect(await runQuotaAutoPingTick(deps, state)).toMatchObject({ sent: 0, failed: 1 });
+  });
+
+  it("ignores exhausted review/Spark quotas and supplies the account identity for usage", async () => {
+    vi.setSystemTime(new Date("2026-01-01T04:00:00Z"));
+    const conn = onePlusConnection({ providerSpecificData: { accountId: "account-plus" } });
+    getCodexUsage.mockImplementation(async (token) => ({ ...codexUsage(activated.has(token)), quotas: {
+      ...codexUsage(activated.has(token)).quotas,
+      review_weekly: { remaining: 0 }, spark_weekly: { remaining: 0 },
+    } }));
+    expect(await runQuotaAutoPingTick(deps, state)).toMatchObject({ sent: 1, verified: 1 });
+    expect(getCodexUsage).toHaveBeenCalledWith("token", expect.objectContaining({ strictProxy: false }), conn.providerSpecificData, expect.any(AbortSignal));
+  });
+
+  it("processes other Plus accounts while one account hangs and retries failures after five minutes", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T04:00:00Z"));
+    onePlusConnection();
+    deps.getProviderConnections.mockImplementation(async ({ provider }) => provider === "codex" ? [
+      { id: "hung", authType: "oauth", accessToken: "hung" },
+      { id: "healthy", authType: "oauth", accessToken: "healthy" },
+    ] : []);
+    getCodexUsage.mockImplementation(async (token) => token === "hung" ? new Promise(() => {}) : codexUsage(activated.has(token)));
+    const tick = runQuotaAutoPingTick(deps, state);
+    await vi.advanceTimersByTimeAsync(25000);
+    expect(await tick).toMatchObject({ attempted: 2, sent: 1, verified: 1, failed: 1 });
+    expect(deps.getExecutor).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(300000);
+    getCodexUsage.mockImplementation(async (token) => codexUsage(activated.has(token)));
+    expect(await runQuotaAutoPingTick(deps, state)).toMatchObject({ attempted: 2, sent: 1, verified: 2, failed: 0 });
+    vi.useRealTimers();
+  });
+
+  it("leaves Appwrite cron in control instead of starting an SSR background timer", () => {
+    vi.useFakeTimers();
+    vi.stubEnv("QUOTA_AUTOPING_EXTERNAL_SCHEDULER", "true");
+    configureQuotaAutoPing({});
+    expect(vi.getTimerCount()).toBe(0);
+    vi.unstubAllEnvs();
+    vi.useRealTimers();
+  });
+
+  it("does not mark a slot verified when its weekly quota blocks activation", async () => {
+    vi.setSystemTime(new Date("2026-01-01T04:00:00Z"));
+    const conn = onePlusConnection();
+    getCodexUsage.mockResolvedValue({ ...codexUsage(), quotas: {
+      ...codexUsage().quotas, weekly: { used: 100, remaining: 0, resetAt: "2026-01-03T04:00:00Z" },
+    } });
+    const summary = await runQuotaAutoPingTick(deps, state);
+    expect(summary).toMatchObject({ sent: 0, verified: 0, pending: 1 });
+    expect(summary.accounts[0].reason).toBe("weekly-exhausted");
+    expect(conn.lastAutoPingSlot).toBeUndefined();
   });
 });
