@@ -16,15 +16,18 @@ Codex Plus được kiểm tra riêng theo từng tài khoản OAuth đang bật
 ## Điều kiện hoàn thành
 
 HTTP 200 chưa chứng minh quota được kích. Stream phải có sự kiện hoàn thành;
-usage đọc bằng cùng `ChatGPT-Account-ID` phải có mức sử dụng lớn hơn 0 và mốc
-reset thuộc cửa sổ 5 giờ bắt đầu từ giờ hẹn hoặc muộn hơn. Chỉ khi đó mới lưu
-`lastAutoPingSlot`. Usage được kiểm tra lại ở các lượt sau, kể cả khi có marker
-từ phiên bản cũ.
+usage đọc bằng cùng `ChatGPT-Account-ID` phải có mốc reset thuộc cửa sổ 5 giờ
+bắt đầu từ giờ hẹn hoặc muộn hơn. Nếu mức sử dụng lớn hơn 0 thì xác nhận ngay.
+Nếu usage làm tròn về 0%, phải chờ ít nhất hai phút rồi kiểm tra deadline còn
+neo ở thời điểm ping trước đó (cho phép lệch tối đa một phút); cửa sổ chưa mở
+sẽ trượt deadline theo thời gian hiện tại và không vượt qua kiểm tra này.
+Chỉ sau khi xác nhận mới lưu `lastAutoPingSlot`. Usage được kiểm tra lại ở các
+lượt sau, kể cả khi có marker từ phiên bản cũ.
 
 Nếu cửa sổ trước chưa hết (ví dụ ping lúc 06:01, reset lúc 11:01), tài khoản
 được giữ `pending` đến lượt kiểm tra sau. Nếu quota vẫn đầy sau ping, lượt sau
-sẽ thử lại. Usage có thể làm tròn request rất nhỏ về 0%; khi đó hệ thống tiếp
-tục giữ pending, không tuyên bố đã xác nhận kích quota.
+sẽ thử lại nếu deadline vẫn trượt, hoặc xác nhận `window-reset-fixed` khi
+deadline đã cố định dù phần trăm sử dụng vẫn là 0%.
 
 Các tài khoản được xử lý đồng thời, mỗi tài khoản có giới hạn 25 giây. Lỗi một
 tài khoản không bỏ qua các tài khoản còn lại. Weekly của Codex thường có thể

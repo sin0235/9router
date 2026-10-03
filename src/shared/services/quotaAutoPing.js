@@ -115,11 +115,19 @@ function hasExhaustedBlockingQuota(quotas, sessionKey, provider) {
   ));
 }
 
-function isCodexSlotActive(quota, slot, providerConfig) {
+function isCodexSlotActive(quota, slot, providerConfig, connection) {
   // A successful HTTP response can still belong to the previous 5h window.
-  // Zero usage alone does not prove activation, even with a future reset time.
-  return toFiniteNumber(quota?.used, 0) > 0
-    && new Date(quota?.resetAt).getTime() >= slot.startsAt + providerConfig.sessionWindowMs;
+  const resetMs = new Date(quota?.resetAt).getTime();
+  if (!(resetMs >= slot.startsAt + providerConfig.sessionWindowMs)) return false;
+  if (toFiniteNumber(quota?.used, 0) > 0) return true;
+
+  // Tiny requests may round to 0%. An idle window slides to now + 5h;
+  // a real window keeps a deadline anchored before a completed ping.
+  // Wait two ticks so an idle window cannot pass the one-tick clock tolerance.
+  const pingMs = new Date(connection?.lastPingAt).getTime();
+  return Number.isFinite(pingMs)
+    && Date.now() - pingMs >= 2 * C.tickIntervalMs
+    && resetMs <= pingMs + providerConfig.sessionWindowMs + C.tickIntervalMs;
 }
 
 function shouldPingForReset(providerConfig, cachedReset, resetAt, now) {
@@ -333,12 +341,12 @@ async function pingConnection(conn, provider, providerConfig, handler, deps, sta
 
   if (provider === "codex") {
     if (!quota) throw new Error("Codex usage did not include the session quota");
-    if (isCodexSlotActive(quota, scheduledSlot, providerConfig)) {
+    if (isCodexSlotActive(quota, scheduledSlot, providerConfig, connection)) {
       signal.throwIfAborted();
       if (connection.lastAutoPingSlot !== scheduledSlot.id) {
         await deps.updateProviderConnection(connection.id, { lastAutoPingSlot: scheduledSlot.id });
       }
-      return { status: "verified", verified: true, reason: "window-active", resetAt: quota.resetAt, remaining: quota.remaining };
+      return { status: "verified", verified: true, reason: toFiniteNumber(quota.used, 0) > 0 ? "window-active" : "window-reset-fixed", resetAt: quota.resetAt, remaining: quota.remaining };
     }
     // A 06:01 activation expires at 11:01. A request at 11:00 cannot open the next window.
     if (new Date(quota.resetAt).getTime() > Date.now()
@@ -378,7 +386,7 @@ async function pingConnection(conn, provider, providerConfig, handler, deps, sta
     const checked = await getUsageWithRetry(connection, handler, proxyOptions, deps, signal, provider);
     const checkedQuota = checked.usage.quotas[providerConfig.quotaKey];
     verification = {
-      verified: isCodexSlotActive(checkedQuota, scheduledSlot, providerConfig),
+      verified: isCodexSlotActive(checkedQuota, scheduledSlot, providerConfig, connection),
       resetAt: checkedQuota?.resetAt,
       remaining: checkedQuota?.remaining,
       retries: checked.retries,

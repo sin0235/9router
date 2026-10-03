@@ -386,4 +386,35 @@ describe("quota auto-ping", () => {
     expect(summary.accounts[0].reason).toBe("weekly-exhausted");
     expect(conn.lastAutoPingSlot).toBeUndefined();
   });
+
+  it.each([6, 11, 16, 21])("confirms a fixed reset at %s:05 when a tiny request still rounds to full quota", async (hour) => {
+    const start = Date.UTC(2026, 0, 1, (hour + 24 - 7) % 24);
+    vi.setSystemTime(start);
+    const conn = onePlusConnection();
+    const resetAt = new Date(start + 5 * 3600000).toISOString();
+    getCodexUsage.mockResolvedValue({ plan: "Plus", quotas: { session: { used: 0, remaining: 100, resetAt } } });
+    expect(await runQuotaAutoPingTick(deps, state)).toMatchObject({ sent: 1, verified: 0, pending: 1 });
+    expect(conn.lastAutoPingSlot).toBeUndefined();
+
+    vi.setSystemTime(start + 5 * 60000);
+    const checked = await runQuotaAutoPingTick(deps, state);
+    expect(checked).toMatchObject({ sent: 0, verified: 1, pending: 0 });
+    expect(checked.accounts[0].reason).toBe("window-reset-fixed");
+    expect(deps.getExecutor).toHaveBeenCalledOnce();
+    expect(conn.lastAutoPingSlot).toBeTruthy();
+  });
+
+  it("retries an idle full window whose reset deadline keeps sliding", async () => {
+    const start = Date.parse("2026-01-01T04:00:00Z");
+    vi.setSystemTime(start);
+    const conn = onePlusConnection();
+    getCodexUsage.mockImplementation(async () => ({ plan: "Plus", quotas: { session: {
+      used: 0, remaining: 100, resetAt: new Date(Date.now() + 5 * 3600000).toISOString(),
+    } } }));
+    expect(await runQuotaAutoPingTick(deps, state)).toMatchObject({ sent: 1, verified: 0, pending: 1 });
+    vi.setSystemTime(start + 5 * 60000);
+    expect(await runQuotaAutoPingTick(deps, state)).toMatchObject({ sent: 1, verified: 0, pending: 1 });
+    expect(conn.lastAutoPingSlot).toBeUndefined();
+    expect(deps.getExecutor).toHaveBeenCalledTimes(2);
+  });
 });
