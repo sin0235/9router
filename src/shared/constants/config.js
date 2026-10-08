@@ -84,8 +84,8 @@ export const QUOTA_AUTOPING_CONFIG = {
     codex: {
       settingsKey: "codexAutoPing",
       quotaKey: "session",
-      minPingIntervalMs: 240000,        // allow the :05 retry even if :00 finished a few seconds late
-      failureCooldownMs: 240000,
+      minPingIntervalMs: 60000,         // allow the 2min cron retry even if the previous request finished late
+      failureCooldownMs: 60000,
       sessionWindowMs: 5 * 60 * 60 * 1000,
       skipWhenBlockingQuotaExhausted: true,
       schedule: true,
