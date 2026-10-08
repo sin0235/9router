@@ -20,8 +20,8 @@ Không dùng credit reset quota.
 HTTP 200 chưa chứng minh quota được kích. Stream phải có sự kiện hoàn thành;
 usage đọc bằng cùng `ChatGPT-Account-ID` phải có mốc reset thuộc cửa sổ 5 giờ
 bắt đầu từ giờ hẹn hoặc muộn hơn. Nếu mức sử dụng lớn hơn 0 thì xác nhận ngay.
-Nếu usage làm tròn về 0%, phải chờ ít nhất hai phút rồi kiểm tra deadline còn
-neo ở thời điểm ping trước đó (cho phép lệch tối đa một phút); cửa sổ chưa mở
+Nếu usage làm tròn về 0%, phải chờ ít nhất một phút rồi kiểm tra deadline còn
+neo ở thời điểm ping trước đó (cho phép lệch tối đa 30 giây); cửa sổ chưa mở
 sẽ trượt deadline theo thời gian hiện tại và không vượt qua kiểm tra này.
 Chỉ sau khi xác nhận mới lưu `lastAutoPingSlot`, `lastAutoPingVerifiedAt` và
 `lastAutoPingVerifiedResetAt`. Marker chỉ ghi "đã gửi" từ phiên bản cũ không

@@ -130,12 +130,12 @@ function isCodexSlotActive(quota, slot, providerConfig, connection) {
 function isCodexResetFixed(quota, providerConfig, connection) {
   // Tiny requests may round to 0%. An idle window slides to now + 5h;
   // a real window keeps a deadline anchored before a completed ping.
-  // Wait two ticks so an idle window cannot pass the one-tick clock tolerance.
+  // Wait one tick so an idle window cannot pass the half-tick clock tolerance.
   const pingMs = new Date(connection?.lastPingAt).getTime();
   return Number.isFinite(pingMs)
     && new Date(quota?.resetAt).getTime() > Date.now()
-    && Date.now() - pingMs >= 2 * C.tickIntervalMs
-    && new Date(quota?.resetAt).getTime() <= pingMs + providerConfig.sessionWindowMs + C.tickIntervalMs;
+    && Date.now() - pingMs >= C.tickIntervalMs
+    && new Date(quota?.resetAt).getTime() <= pingMs + providerConfig.sessionWindowMs + C.tickIntervalMs / 2;
 }
 
 function shouldPingForReset(providerConfig, cachedReset, resetAt, now) {
